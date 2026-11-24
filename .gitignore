@@ -3,3 +3,27 @@ node_modules/
 .env.*
 !.env.example
 dist/
+uploads_private/
+backend/uploads_private/
+
+
+# Dependencies
+node_modules/
+
+# Environment secrets
+.env
+.env.*
+!.env.example
+
+# Build files
+dist/
+dist-ssr/
+
+# Private uploads
+uploads_private/
+backend/uploads_private/
+backend/uploads/
+
+# Backup archives
+backend.zip
+frontend.zip

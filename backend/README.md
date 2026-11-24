@@ -15,6 +15,7 @@ The backend creates partial unique indexes for student IDs and email addresses w
 - `AUTH_MODE=oidc` enables campus OpenID Connect SSO. Configure `OIDC_ISSUER`, `OIDC_CLIENT_ID`, `OIDC_CLIENT_SECRET`, `OIDC_REDIRECT_URI`, and `OIDC_STUDENT_ID_CLAIM`. The provider must return a verified email and a positive numeric student ID claim. Register the redirect URI with the identity provider. Existing local accounts are not automatically linked; an administrator must verify and link them.
 - Production startup requires `AUTH_MODE=oidc` and complete OIDC settings; the server will not start in local-account mode.
 - Set `CLIENT_ORIGINS` to a comma-separated list of exact frontend origins, and set `FRONTEND_URL` to the frontend URL used after SSO.
+- Authentication routes allow 100 attempts per 15 minutes in local development and 10 otherwise. Override `AUTH_RATE_LIMIT_MAX` and `AUTH_RATE_LIMIT_WINDOW_MS` in `.env` if needed; both must be positive integers. The local in-memory limiter resets when the backend process restarts.
 
 ## Item board API
 
