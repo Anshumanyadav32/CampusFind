@@ -12,6 +12,7 @@ export default function ProfileView({
   API_BASE_URL,
   onHandoverSuccess,
   confirmMatch,
+  confirmingMatchId,
   onOpenDispute,
   onWithdrawClaim,
   openReport,
@@ -20,6 +21,9 @@ export default function ProfileView({
 }) {
   const [handoverState, setHandoverState] = useState({});
   const [handoverSubmitting, setHandoverSubmitting] = useState({});
+  const reports = profileData?.reports || [];
+  const activeReports = reports.filter((item) => item.status !== "returned");
+  const returnedReports = reports.filter((item) => item.status === "returned");
 
   async function submitHandoverOtp(claim) {
     if (handoverSubmitting[claim._id]) return;
@@ -59,6 +63,64 @@ export default function ProfileView({
     } finally {
       setHandoverSubmitting((previous) => ({ ...previous, [claim._id]: false }));
     }
+  }
+
+  function renderReportCards(items) {
+    return (
+      <div className="items-grid">
+        {items.map((item, index) => {
+          const updatedAt = item.updatedAt ? new Date(item.updatedAt) : null;
+          const returnedDate = updatedAt && !Number.isNaN(updatedAt.getTime())
+            ? ` · ${updatedAt.toLocaleDateString("en-IN", {
+                day: "numeric",
+                month: "short",
+                year: "numeric"
+              })}`
+            : "";
+
+          return (
+            <article className="item-card" key={item._id}>
+              <div className={`item-visual visual-${index % 5}`}>
+                <span className="visual-decoration decoration-one">✳</span>
+                <span className="item-symbol">{getItemIcon(item)}</span>
+                <span className={`status-pill ${item.reportType}`}>
+                  <span /> {item.reportType === "lost" ? "LOST ITEM" : "FOUND ITEM"}
+                </span>
+              </div>
+              <div className="item-info">
+                <div className="item-category-row">
+                  <span className="item-category">{item.category}</span>
+                  <span className="item-date">
+                    {item.dateReported
+                      ? new Date(item.dateReported).toLocaleDateString("en-IN", {
+                          day: "numeric",
+                          month: "short",
+                        })
+                      : ""}
+                  </span>
+                </div>
+                <h3>{item.itemName}</h3>
+                <div className="item-detail">
+                  <span>◉</span> {item.color}
+                </div>
+                <div className="item-detail">
+                  <span>⌖</span> {item.location}
+                </div>
+                <div className="item-card-footer">
+                  <span className="item-status-text">
+                    {item.status === "returned"
+                      ? `✓ RETURNED${returnedDate}`
+                      : item.reportType === "lost"
+                        ? "Still looking"
+                        : "Waiting for owner"}
+                  </span>
+                </div>
+              </div>
+            </article>
+          );
+        })}
+      </div>
+    );
   }
 
   return (
@@ -187,8 +249,16 @@ export default function ProfileView({
                       {match.isLostReporter &&
                         ["pending", "confirming"].includes(match.status) && (
                           <div style={{ display: "flex", gap: "6px" }}>
-                            <button className="button button-dark" onClick={() => confirmMatch(match)}>
-                              {match.status === "confirming" ? "Resume confirmation" : "Confirm returned"}
+                            <button
+                              className="button button-dark"
+                              disabled={confirmingMatchId === match._id}
+                              onClick={() => confirmMatch(match)}
+                            >
+                              {confirmingMatchId === match._id
+                                ? "Confirming..."
+                                : match.status === "confirming"
+                                  ? "Resume confirmation"
+                                  : "Confirm returned"}
                             </button>
                             <button
                               className="button button-outline"
@@ -292,12 +362,21 @@ export default function ProfileView({
                       )}
                       {claim.status === "approved" && (
                         <div style={{ marginTop: "8px" }}>
-                          <small style={{ display: "block", color: "#274029", marginBottom: "6px" }}>
-                            Handover OTP issued. Enter the six-digit code emailed to you.
-                          </small>
-                          {claim.handoverOtpEmailStatus === "failed" && (
+                          {claim.handoverOtpEmailStatus === "sent" ? (
+                            <small style={{ display: "block", color: "#274029", marginBottom: "6px" }}>
+                              Handover OTP issued. Enter the six-digit code emailed to you.
+                            </small>
+                          ) : claim.handoverOtpEmailStatus === "failed" ? (
                             <small style={{ display: "block", color: "#b12d2d", marginBottom: "6px" }}>
                               The OTP email could not be delivered. Contact campus administration.
+                            </small>
+                          ) : claim.handoverOtpEmailStatus === "smtp_not_configured" ? (
+                            <small style={{ display: "block", color: "#b12d2d", marginBottom: "6px" }}>
+                              Email delivery is unavailable (SMTP not configured). Contact campus administration.
+                            </small>
+                          ) : (
+                            <small style={{ display: "block", color: "#475569", marginBottom: "6px" }}>
+                              Handover OTP issued. Awaiting email delivery confirmation.
                             </small>
                           )}
                           <input
@@ -355,62 +434,35 @@ export default function ProfileView({
             <div className="section-heading">
               <div>
                 <div className="section-kicker"><span /> YOUR ACTIVITY</div>
-                <h2>My reports<span>.</span></h2>
+                <h2>My active reports<span>.</span></h2>
               </div>
               <button className="button button-dark" onClick={() => openReport("lost")}>
                 Report an item <span>↗</span>
               </button>
             </div>
 
-            {profileData.reports.length === 0 ? (
+            {activeReports.length === 0 ? (
               <div className="state-panel empty-panel">
                 <span className="state-emoji">✳</span>
-                <h3>No reports yet.</h3>
-                <p>Your lost and found reports will appear here.</p>
+                <h3>No active reports.</h3>
+                <p>Your active lost and found reports will appear here.</p>
               </div>
             ) : (
-              <div className="items-grid">
-                {profileData.reports.map((item, index) => (
-                  <article className="item-card" key={item._id}>
-                    <div className={`item-visual visual-${index % 5}`}>
-                      <span className="visual-decoration decoration-one">✳</span>
-                      <span className="item-symbol">{getItemIcon(item)}</span>
-                      <span className={`status-pill ${item.reportType}`}>
-                        <span /> {item.reportType === "lost" ? "LOST ITEM" : "FOUND ITEM"}
-                      </span>
-                    </div>
-                    <div className="item-info">
-                      <div className="item-category-row">
-                        <span className="item-category">{item.category}</span>
-                        <span className="item-date">
-                          {item.dateReported
-                            ? new Date(item.dateReported).toLocaleDateString("en-IN", {
-                                day: "numeric",
-                                month: "short",
-                              })
-                            : ""}
-                        </span>
-                      </div>
-                      <h3>{item.itemName}</h3>
-                      <div className="item-detail">
-                        <span>◉</span> {item.color}
-                      </div>
-                      <div className="item-detail">
-                        <span>⌖</span> {item.location}
-                      </div>
-                      <div className="item-card-footer">
-                        <span className="item-status-text">
-                          {item.status === "returned"
-                            ? "✓ Returned"
-                            : item.reportType === "lost"
-                              ? "Still looking"
-                              : "Waiting for owner"}
-                        </span>
-                      </div>
-                    </div>
-                  </article>
-                ))}
+              renderReportCards(activeReports)
+            )}
+          </section>
+
+          <section className="profile-reports">
+            <div className="section-heading">
+              <div>
+                <div className="section-kicker"><span /> COMPLETED REPORTS</div>
+                <h2>My report history<span>.</span></h2>
               </div>
+            </div>
+            {returnedReports.length === 0 ? (
+              <p className="profile-empty-note">Returned reports will appear here.</p>
+            ) : (
+              renderReportCards(returnedReports)
             )}
           </section>
         </>

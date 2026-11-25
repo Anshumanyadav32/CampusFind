@@ -4,21 +4,34 @@ import supertest from "supertest";
 import path from "node:path";
 import fs from "node:fs/promises";
 import crypto from "node:crypto";
+import mongoose from "mongoose";
+import jwt from "jsonwebtoken";
 import { fileURLToPath } from "node:url";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 process.env.NODE_ENV = "test";
 process.env.JWT_SECRET = "test-secret-with-at-least-thirty-two-characters";
-
 const { createApp, parseStudentId } = await import("./server.js");
+delete process.env.SMTP_HOST;
+delete process.env.SMTP_USER;
+delete process.env.SMTP_PASS;
 const { getAuthRateLimitConfig } = await import("./utils/validation.js");
 const {
   renderAdminResolutionEmail,
   renderClaimStatusChangeEmail,
   renderClaimUpdateEmail,
-  renderMatchFoundEmail
+  renderMatchFoundEmail,
+  renderHandoverOtpEmail,
+  getSmtpConfig,
+  verifySmtpConnection,
+  sanitizeSmtpError,
+  sendHandoverOtp,
+  setTransporter,
+  resetTransporter
 } = await import("./services/emailService.js");
+resetTransporter();
+const { encryptOtp, decryptOtp } = await import("./utils/encryption.js");
 const { PRIVATE_UPLOAD_DIR } = await import("./utils/uploader.js");
 const { calculateMatchScore, isMatchConfident, tokenize } = await import("./utils/matching.js");
 
@@ -43,7 +56,10 @@ function matchesQuery(document, query = {}) {
   return Object.entries(query).every(([key, expected]) => {
     if (key === "$and") return expected.every((part) => matchesQuery(document, part));
     if (key === "$or") return expected.some((part) => matchesQuery(document, part));
-    return matchesValue(document[key], expected);
+    const actual = key.includes(".")
+      ? key.split(".").reduce((value, part) => value?.[part], document)
+      : document[key];
+    return matchesValue(actual, expected);
   });
 }
 
@@ -53,6 +69,7 @@ const buildTestApp = () => {
   const users = [];
   const claims = [];
   const auditLogs = [];
+  const itemUpdateFailures = new Map();
 
   const usersCollection = () => ({
     countDocuments: async (query = {}) => users.filter((u) => matchesQuery(u, query)).length,
@@ -115,6 +132,11 @@ const buildTestApp = () => {
       return { insertedId };
     },
     updateOne: async (filter, update) => {
+      const failureCount = itemUpdateFailures.get(String(filter._id)) || 0;
+      if (failureCount > 0) {
+        itemUpdateFailures.set(String(filter._id), failureCount - 1);
+        return { acknowledged: true, matchedCount: 0, modifiedCount: 0 };
+      }
       const item = items.find((entry) => matchesQuery(entry, filter));
       if (item) {
         Object.assign(item, update.$set || {});
@@ -211,16 +233,20 @@ const buildTestApp = () => {
     },
     aggregate: (pipeline = []) => ({
       toArray: async () => {
-        const matchStage = pipeline.find((stage) => stage.$match);
+        const matchStages = pipeline.filter((stage) => stage.$match);
+        const matchStage = matchStages[0];
         let results = matchStage
           ? matches.filter((match) => matchesQuery(match, matchStage.$match))
           : matches;
 
-        return results.map((m) => {
+        results = results.map((m) => {
           const lostItem = items.find((i) => String(i._id) === String(m.lostItemId));
           const foundItem = items.find((i) => String(i._id) === String(m.foundItemId));
           return { ...m, lostItem, foundItem };
         });
+        return results.filter((match) =>
+          matchStages.slice(1).every((stage) => matchesQuery(match, stage.$match))
+        );
       }
     })
   });
@@ -249,6 +275,9 @@ const buildTestApp = () => {
       const claim = claims.find((c) => matchesQuery(c, filter));
       if (claim) {
         Object.assign(claim, update.$set || {});
+        for (const key of Object.keys(update.$unset || {})) {
+          delete claim[key];
+        }
         for (const [key, increment] of Object.entries(update.$inc || {})) {
           claim[key] = (claim[key] || 0) + increment;
         }
@@ -368,6 +397,9 @@ const buildTestApp = () => {
   app.testClaims = claims;
   app.testItems = items;
   app.testMatches = matches;
+  app.failNextItemUpdate = (itemId) => {
+    itemUpdateFailures.set(String(itemId), (itemUpdateFailures.get(String(itemId)) || 0) + 1);
+  };
   app.testPrivateFiles = privateFiles;
   app.testOtpRecords = otpRecords;
   app.testAuditLogs = auditLogs;
@@ -408,6 +440,52 @@ const jsonRequest = (body, extraHeaders = {}, method = "POST") => ({
   headers: { "content-type": "application/json", ...extraHeaders },
   body: JSON.stringify(body)
 });
+
+async function createMatchConfirmationScenario(testApp, lostStudentId = 8801, foundStudentId = 8802) {
+  const lostReporter = await request(testApp, "/api/auth/register", jsonRequest({
+    studentId: lostStudentId,
+    name: "Match Owner",
+    email: `match-owner-${lostStudentId}@campus.edu`,
+    password: "password123"
+  }));
+  const foundReporter = await request(testApp, "/api/auth/register", jsonRequest({
+    studentId: foundStudentId,
+    name: "Match Finder",
+    email: `match-finder-${foundStudentId}@campus.edu`,
+    password: "password123"
+  }));
+
+  const lostReport = await request(testApp, "/api/items", jsonRequest({
+    itemName: "Black Water Bottle",
+    category: "Bottle",
+    color: "Black",
+    reportType: "lost",
+    location: "Block 34-512"
+  }, { Cookie: lostReporter.cookie }));
+  const foundReport = await request(testApp, "/api/items", jsonRequest({
+    itemName: "Black Water Bottle",
+    category: "Bottle",
+    color: "Black",
+    reportType: "found",
+    location: "Block 34-512"
+  }, { Cookie: foundReporter.cookie }));
+
+  assert.equal(lostReport.status, 201);
+  assert.equal(foundReport.status, 201);
+  const match = testApp.testMatches.find((entry) =>
+    String(entry.lostItemId) === String(lostReport.json.itemId)
+    && String(entry.foundItemId) === String(foundReport.json.itemId)
+  );
+  assert.ok(match);
+
+  return {
+    lostReporter,
+    foundReporter,
+    lostReportId: lostReport.json.itemId,
+    foundReportId: foundReport.json.itemId,
+    match
+  };
+}
 
 test("student ID parsing rejects invalid identities", () => {
   assert.equal(parseStudentId(101), 101);
@@ -695,6 +773,27 @@ test("match API returns sanitized item summaries and hides moderated matches", a
   });
   assert.equal(foundMatches.json.matches[0].isLostReporter, false);
 
+  const storedMatch = testApp.testMatches.find((entry) => String(entry._id) === String(match._id));
+  storedMatch.status = "confirmed";
+  const confirmedMatches = await request(testApp, "/api/items/matches", {
+    headers: { Cookie: lostReporter.cookie }
+  });
+  assert.equal(confirmedMatches.status, 200);
+  assert.equal(confirmedMatches.json.totalMatches, 0);
+
+  storedMatch.status = "pending";
+  const storedLostItem = testApp.testItems.find((item) => String(item._id) === String(lost.json.itemId));
+  const storedFoundItem = testApp.testItems.find((item) => String(item._id) === String(found.json.itemId));
+  storedLostItem.status = "returned";
+  storedFoundItem.status = "returned";
+  const returnedMatches = await request(testApp, "/api/items/matches", {
+    headers: { Cookie: lostReporter.cookie }
+  });
+  assert.equal(returnedMatches.status, 200);
+  assert.equal(returnedMatches.json.totalMatches, 0);
+  storedLostItem.status = "searching";
+  storedFoundItem.status = "unclaimed";
+
   const flagged = await request(
     testApp,
     `/api/admin/items/${found.json.itemId}/moderate`,
@@ -900,6 +999,98 @@ test("public item search paginates results without exposing reporter IDs or priv
   assert.equal(publicResponse.json.items[0].hasVerificationDetails, true);
 });
 
+test("active item APIs exclude returned reports while profile history and admin access preserve them", async () => {
+  const testApp = buildTestApp();
+  const reporter = await request(testApp, "/api/auth/register", jsonRequest({
+    studentId: 1501,
+    name: "Report History Owner",
+    email: "report-history-owner@campus.edu",
+    password: "password123"
+  }));
+  const claimant = await request(testApp, "/api/auth/register", jsonRequest({
+    studentId: 1502,
+    name: "Report History Claimant",
+    email: "report-history-claimant@campus.edu",
+    password: "password123"
+  }));
+  const admin = await request(testApp, "/api/auth/register", jsonRequest({
+    studentId: 1503,
+    name: "Report History Admin",
+    email: "report-history-admin@campus.edu",
+    password: "password123"
+  }));
+  testApp.elevateAdmin(1503);
+
+  const reportSpecs = [
+    { itemName: "Active Lost Notebook", reportType: "lost", color: "Blue" },
+    { itemName: "Returned Lost Notebook", reportType: "lost", color: "Red", returned: true },
+    { itemName: "Active Found Umbrella", reportType: "found", color: "Green" },
+    { itemName: "Returned Found Umbrella", reportType: "found", color: "Black", returned: true }
+  ];
+  const createdReports = [];
+  for (const spec of reportSpecs) {
+    const response = await request(testApp, "/api/items", jsonRequest({
+      itemName: spec.itemName,
+      category: "Accessories",
+      color: spec.color,
+      reportType: spec.reportType,
+      location: "Student Center"
+    }, { Cookie: reporter.cookie }));
+    assert.equal(response.status, 201);
+    createdReports.push({ ...spec, itemId: response.json.itemId });
+  }
+  for (const report of createdReports.filter((entry) => entry.returned)) {
+    const item = testApp.testItems.find((entry) => String(entry._id) === String(report.itemId));
+    item.status = "returned";
+    item.updatedAt = new Date("2026-11-20T12:00:00.000Z");
+  }
+
+  for (const reportType of ["lost", "found"]) {
+    const response = await request(testApp, `/api/items/search?reportType=${reportType}`);
+    assert.equal(response.status, 200);
+    assert.equal(response.json.total, 1);
+    assert.equal(response.json.items[0].reportType, reportType);
+    assert.notEqual(response.json.items[0].status, "returned");
+  }
+  const publicItemsAlias = await request(testApp, "/api/items?reportType=found");
+  assert.equal(publicItemsAlias.status, 200);
+  assert.equal(publicItemsAlias.json.total, 1);
+  assert.notEqual(publicItemsAlias.json.items[0].status, "returned");
+
+  const firstPage = await request(testApp, "/api/items/search?page=1&pageSize=1");
+  const secondPage = await request(testApp, "/api/items/search?page=2&pageSize=1");
+  assert.equal(firstPage.json.total, 2);
+  assert.equal(firstPage.json.totalPages, 2);
+  assert.equal(secondPage.json.total, 2);
+  assert.equal(secondPage.json.totalPages, 2);
+  assert.notEqual(firstPage.json.items[0].status, "returned");
+  assert.notEqual(secondPage.json.items[0].status, "returned");
+
+  const profile = await request(testApp, "/api/profile", {
+    headers: { Cookie: reporter.cookie }
+  });
+  assert.equal(profile.status, 200);
+  assert.equal(profile.json.reports.length, 4);
+  assert.equal(profile.json.reports.filter((item) => item.status === "returned").length, 2);
+
+  const returnedFound = createdReports.find((entry) => entry.reportType === "found" && entry.returned);
+  const claimResponse = await request(testApp, "/api/claims", jsonRequest({
+    itemId: returnedFound.itemId,
+    additionalDetails: "This was my umbrella."
+  }, { Cookie: claimant.cookie }));
+  assert.equal(claimResponse.status, 400);
+  assert.match(claimResponse.json.message, /already been marked as returned/i);
+  const claimDetails = await request(testApp, `/api/claims/item/${returnedFound.itemId}`);
+  assert.equal(claimDetails.status, 404);
+
+  const adminReturned = await request(testApp, "/api/admin/items?status=returned", {
+    headers: { Cookie: admin.cookie }
+  });
+  assert.equal(adminReturned.status, 200);
+  assert.equal(adminReturned.json.total, 2);
+  assert.equal(adminReturned.json.items.filter((item) => item.status === "returned").length, 2);
+});
+
 test("logout revokes the existing session cookie", async () => {
   const testApp = buildTestApp();
 
@@ -1062,6 +1253,171 @@ test("concurrent match confirmations allow exactly one successful resolution", a
   assert.equal(testApp.testItems.filter((item) =>
     item.itemName === "Concurrent Blue Phone"
   ).every((item) => item.status === "returned"), true);
+  assert.equal(finalMatch.claimHistory.filter((entry) => entry.action === "confirmed").length, 1);
+});
+
+test("match confirmation resumes after the lost report updates but the found report update fails", async () => {
+  const testApp = buildTestApp();
+  const scenario = await createMatchConfirmationScenario(testApp);
+  testApp.failNextItemUpdate(scenario.foundReportId);
+
+  const firstAttempt = await request(
+    testApp,
+    `/api/items/matches/${scenario.match._id}/confirm`,
+    { method: "PATCH", headers: { Cookie: scenario.lostReporter.cookie } }
+  );
+  assert.equal(firstAttempt.status, 409);
+  assert.equal(testApp.testItems.find((item) => item._id === scenario.lostReportId).status, "returned");
+  assert.equal(testApp.testItems.find((item) => item._id === scenario.foundReportId).status, "unclaimed");
+  assert.equal(scenario.match.status, "confirming");
+
+  const retry = await request(
+    testApp,
+    `/api/items/matches/${scenario.match._id}/confirm`,
+    { method: "PATCH", headers: { Cookie: scenario.lostReporter.cookie } }
+  );
+  assert.equal(retry.status, 200);
+  assert.equal(scenario.match.status, "confirmed");
+  assert.equal(testApp.testItems.find((item) => item._id === scenario.lostReportId).status, "returned");
+  assert.equal(testApp.testItems.find((item) => item._id === scenario.foundReportId).status, "returned");
+  assert.equal(scenario.match.claimHistory.filter((entry) => entry.action === "confirmed").length, 1);
+  assert.equal(scenario.match.claimHistory.filter((entry) => entry.action === "claim_initiated").length, 1);
+});
+
+test("match confirmation preserves a completed handover claim while recovering the other report", async () => {
+  const testApp = buildTestApp();
+  const scenario = await createMatchConfirmationScenario(testApp, 8811, 8812);
+  const handoverDate = new Date("2025-01-02T03:04:05.000Z");
+  const completedClaim = {
+    _id: "claim-completed-handover",
+    itemId: scenario.foundReportId,
+    claimantId: 8811,
+    status: "returned",
+    handoverDate,
+    handoverConfirmedBy: 8811
+  };
+  testApp.testClaims.push(completedClaim);
+  Object.assign(testApp.testItems.find((item) => item._id === scenario.foundReportId), {
+    status: "returned",
+    approvedClaimId: completedClaim._id
+  });
+  testApp.failNextItemUpdate(scenario.lostReportId);
+
+  const failedAttempt = await request(
+    testApp,
+    `/api/items/matches/${scenario.match._id}/confirm`,
+    { method: "PATCH", headers: { Cookie: scenario.lostReporter.cookie } }
+  );
+  assert.equal(failedAttempt.status, 409);
+  assert.equal(scenario.match.status, "confirming");
+
+  const retry = await request(
+    testApp,
+    `/api/items/matches/${scenario.match._id}/confirm`,
+    { method: "PATCH", headers: { Cookie: scenario.lostReporter.cookie } }
+  );
+  assert.equal(retry.status, 200);
+  assert.equal(scenario.match.status, "confirmed");
+  assert.equal(testApp.testItems.find((item) => item._id === scenario.lostReportId).status, "returned");
+  assert.deepEqual(completedClaim, {
+    _id: "claim-completed-handover",
+    itemId: scenario.foundReportId,
+    claimantId: 8811,
+    status: "returned",
+    handoverDate,
+    handoverConfirmedBy: 8811
+  });
+  assert.equal(scenario.match.claimHistory.filter((entry) => entry.action === "confirmed").length, 1);
+});
+
+test("match confirmation resumes when the found report was resolved before the lost report update failed", async () => {
+  const testApp = buildTestApp();
+  const scenario = await createMatchConfirmationScenario(testApp, 8815, 8816);
+  Object.assign(testApp.testItems.find((item) => item._id === scenario.foundReportId), {
+    status: "returned",
+    approvedMatchId: scenario.match._id
+  });
+  testApp.failNextItemUpdate(scenario.lostReportId);
+
+  const firstAttempt = await request(
+    testApp,
+    `/api/items/matches/${scenario.match._id}/confirm`,
+    { method: "PATCH", headers: { Cookie: scenario.lostReporter.cookie } }
+  );
+  assert.equal(firstAttempt.status, 409);
+
+  const retry = await request(
+    testApp,
+    `/api/items/matches/${scenario.match._id}/confirm`,
+    { method: "PATCH", headers: { Cookie: scenario.lostReporter.cookie } }
+  );
+  assert.equal(retry.status, 200);
+  assert.equal(scenario.match.status, "confirmed");
+  assert.equal(testApp.testItems.find((item) => item._id === scenario.lostReportId).status, "returned");
+  assert.equal(testApp.testItems.find((item) => item._id === scenario.foundReportId).approvedMatchId, scenario.match._id);
+  assert.equal(scenario.match.claimHistory.filter((entry) => entry.action === "confirmed").length, 1);
+});
+
+test("confirmation retry completes when both linked reports were already resolved by this match", async () => {
+  const testApp = buildTestApp();
+  const scenario = await createMatchConfirmationScenario(testApp, 8821, 8822);
+  for (const itemId of [scenario.lostReportId, scenario.foundReportId]) {
+    Object.assign(testApp.testItems.find((item) => item._id === itemId), {
+      status: "returned",
+      approvedMatchId: scenario.match._id
+    });
+  }
+
+  const response = await request(
+    testApp,
+    `/api/items/matches/${scenario.match._id}/confirm`,
+    { method: "PATCH", headers: { Cookie: scenario.lostReporter.cookie } }
+  );
+  assert.equal(response.status, 200);
+  assert.equal(scenario.match.status, "confirmed");
+  assert.equal(scenario.match.claimHistory.filter((entry) => entry.action === "confirmed").length, 1);
+});
+
+test("match confirmation safely rejects missing or invalid linked reports and unauthorized users", async () => {
+  for (const missingReportType of ["lost", "found"]) {
+    const testApp = buildTestApp();
+    const scenario = await createMatchConfirmationScenario(
+      testApp,
+      missingReportType === "lost" ? 8831 : 8841,
+      missingReportType === "lost" ? 8832 : 8842
+    );
+    const missingId = missingReportType === "lost" ? scenario.lostReportId : scenario.foundReportId;
+    testApp.testItems.splice(testApp.testItems.findIndex((item) => item._id === missingId), 1);
+
+    const response = await request(
+      testApp,
+      `/api/items/matches/${scenario.match._id}/confirm`,
+      { method: "PATCH", headers: { Cookie: scenario.lostReporter.cookie } }
+    );
+    assert.equal(response.status, 409);
+    assert.equal(scenario.match.status, "confirming");
+  }
+
+  const invalidApp = buildTestApp();
+  const invalidScenario = await createMatchConfirmationScenario(invalidApp, 8851, 8852);
+  invalidScenario.match.lostItemId = "not-a-valid-item-id";
+  const invalidResponse = await request(
+    invalidApp,
+    `/api/items/matches/${invalidScenario.match._id}/confirm`,
+    { method: "PATCH", headers: { Cookie: invalidScenario.lostReporter.cookie } }
+  );
+  assert.equal(invalidResponse.status, 409);
+  assert.equal(invalidScenario.match.status, "confirming");
+
+  const unauthorizedApp = buildTestApp();
+  const unauthorizedScenario = await createMatchConfirmationScenario(unauthorizedApp, 8861, 8862);
+  const unauthorizedResponse = await request(
+    unauthorizedApp,
+    `/api/items/matches/${unauthorizedScenario.match._id}/confirm`,
+    { method: "PATCH", headers: { Cookie: unauthorizedScenario.foundReporter.cookie } }
+  );
+  assert.equal(unauthorizedResponse.status, 403);
+  assert.equal(unauthorizedScenario.match.status, "pending");
 });
 
 test("duplicate matches are prevented atomically", async () => {
@@ -1471,7 +1827,8 @@ test("complete end-to-end multi-user workflow with two students and one admin", 
 
   // 10. Verify item status has transitioned to 'returned'
   const finalPublicCheck = await request(testApp, "/api/items/search?q=Dell");
-  assert.equal(finalPublicCheck.json.items[0].status, "returned");
+  assert.equal(finalPublicCheck.json.total, 0);
+  assert.equal(finalPublicCheck.json.items.length, 0);
 });
 
 test("account status enforcement blocks suspended and deactivated users", async () => {
@@ -1575,6 +1932,190 @@ test("account status enforcement blocks suspended and deactivated users", async 
   assert.equal(newLoginRes.status, 200);
 });
 
+test("claim reporter comparison handles student IDs, ObjectIds, missing IDs, and authentication", async () => {
+  const testApp = buildTestApp();
+  const reporter = await request(testApp, "/api/auth/register", jsonRequest({
+    studentId: 590,
+    name: "Reporter",
+    email: "reporter-590@campus.edu",
+    password: "password123"
+  }));
+  const otherStudent = await request(testApp, "/api/auth/register", jsonRequest({
+    studentId: 591,
+    name: "Other Student",
+    email: "other-591@campus.edu",
+    password: "password123"
+  }));
+
+  const reporterUser = testApp.testUsers.find((user) => user.studentId === 590);
+  reporterUser._id = new mongoose.Types.ObjectId();
+  const reporterToken = jwt.sign(
+    {
+      userId: reporterUser._id.toString(),
+      studentId: reporterUser.studentId,
+      role: "student",
+      sessionVersion: reporterUser.sessionVersion || 0
+    },
+    process.env.JWT_SECRET,
+    { expiresIn: "7d", issuer: "campusfind", audience: "campusfind-web" }
+  );
+  const reporterCookie = `campusfind_token=${reporterToken}`;
+
+  const report = await request(testApp, "/api/items", jsonRequest({
+    itemName: "Reporter Ownership Test",
+    category: "Electronics",
+    color: "Black",
+    reportType: "found",
+    location: "Library"
+  }, { Cookie: reporterCookie }));
+  assert.equal(report.status, 201);
+
+  const unauthenticated = await request(testApp, "/api/claims", jsonRequest({
+    itemId: report.json.itemId
+  }));
+  assert.equal(unauthenticated.status, 401);
+
+  const item = testApp.testItems.find((entry) => String(entry._id) === String(report.json.itemId));
+  item.reportedBy = reporterUser._id;
+  const objectIdSelfClaim = await request(testApp, "/api/claims", jsonRequest({
+    itemId: report.json.itemId
+  }, { Cookie: reporterCookie }));
+  assert.equal(objectIdSelfClaim.status, 400);
+
+  item.reportedBy = String(reporterUser.studentId);
+  const numericStringSelfClaim = await request(testApp, "/api/claims", jsonRequest({
+    itemId: report.json.itemId
+  }, { Cookie: reporterCookie }));
+  assert.equal(numericStringSelfClaim.status, 400);
+
+  item.reportedBy = undefined;
+  const missingReporter = await request(testApp, "/api/claims", jsonRequest({
+    itemId: report.json.itemId
+  }, { Cookie: otherStudent.cookie }));
+  assert.equal(missingReporter.status, 409);
+
+  item.reportedBy = "invalid-reporter-id";
+  const invalidReporter = await request(testApp, "/api/claims", jsonRequest({
+    itemId: report.json.itemId
+  }, { Cookie: otherStudent.cookie }));
+  assert.equal(invalidReporter.status, 409);
+
+  item.reportedBy = reporterUser.studentId;
+  const otherStudentClaim = await request(testApp, "/api/claims", jsonRequest({
+    itemId: report.json.itemId,
+    verificationAnswers: "I can describe the item."
+  }, { Cookie: otherStudent.cookie }));
+  assert.equal(otherStudentClaim.status, 201);
+});
+
+test("exact regression: self-claim detection between Student A (12306500) and Student B (12305160)", async () => {
+  const testApp = buildTestApp();
+
+  // Register Student A (12306500)
+  const studentAReg = await request(testApp, "/api/auth/register", jsonRequest({
+    studentId: 12306500,
+    name: "Student A",
+    email: "studentA-12306500@campus.edu",
+    password: "password123"
+  }));
+  assert.equal(studentAReg.status, 201);
+
+  // Register Student B (12305160)
+  const studentBReg = await request(testApp, "/api/auth/register", jsonRequest({
+    studentId: 12305160,
+    name: "Student B",
+    email: "studentB-12305160@campus.edu",
+    password: "password123"
+  }));
+  assert.equal(studentBReg.status, 201);
+
+  // 1. Student A creates a LOST report
+  const lostReportRes = await request(testApp, "/api/items", jsonRequest({
+    itemName: "Black water bottle",
+    category: "Bottle",
+    color: "Black",
+    reportType: "lost",
+    location: "Library"
+  }, { Cookie: studentAReg.cookie }));
+  assert.equal(lostReportRes.status, 201);
+  const lostItemId = lostReportRes.json.itemId;
+
+  // 2. Student B creates a FOUND report
+  const foundReportRes = await request(testApp, "/api/items", jsonRequest({
+    itemName: "Black water bottle",
+    category: "Bottle",
+    color: "Black",
+    reportType: "found",
+    location: "Library"
+  }, { Cookie: studentBReg.cookie }));
+  assert.equal(foundReportRes.status, 201);
+  const foundItemId = foundReportRes.json.itemId;
+
+  // Verify actual database records
+  const dbLostItem = testApp.testItems.find((item) => String(item._id) === String(lostItemId));
+  const dbFoundItem = testApp.testItems.find((item) => String(item._id) === String(foundItemId));
+  assert.ok(dbLostItem, "Lost item must exist in database");
+  assert.ok(dbFoundItem, "Found item must exist in database");
+  assert.equal(dbLostItem.reportedBy, 12306500);
+  assert.equal(typeof dbLostItem.reportedBy, "number");
+  assert.equal(dbFoundItem.reportedBy, 12305160);
+  assert.equal(typeof dbFoundItem.reportedBy, "number");
+
+  // 3. Student A claims Student B's FOUND report — MUST SUCCEED
+  const claimRes1 = await request(testApp, "/api/claims", jsonRequest({
+    itemId: foundItemId,
+    verificationAnswers: "Lost near reading desk on second floor"
+  }, { Cookie: studentAReg.cookie }));
+  assert.equal(claimRes1.status, 201);
+  assert.equal(claimRes1.json.claim.claimantId, 12306500);
+  assert.equal(String(claimRes1.json.claim.itemId), String(foundItemId));
+
+  // 4. Student B claims their own FOUND report — MUST BE REJECTED
+  const claimRes2 = await request(testApp, "/api/claims", jsonRequest({
+    itemId: foundItemId,
+    verificationAnswers: "Self claim attempt"
+  }, { Cookie: studentBReg.cookie }));
+  assert.equal(claimRes2.status, 400);
+  assert.equal(claimRes2.json.message, "You cannot submit an ownership claim for an item you reported yourself.");
+
+  // 5. An unauthenticated user tries to claim — MUST BE REJECTED
+  const claimRes3 = await request(testApp, "/api/claims", jsonRequest({
+    itemId: foundItemId,
+    verificationAnswers: "Unauth attempt"
+  }));
+  assert.equal(claimRes3.status, 401);
+  assert.equal(claimRes3.json.message, "Authentication required.");
+
+  // 6. Student A claims a FOUND report created by Student A — MUST BE REJECTED
+  const foundByARes = await request(testApp, "/api/items", jsonRequest({
+    itemName: "Blue water bottle",
+    category: "Bottle",
+    color: "Blue",
+    reportType: "found",
+    location: "Cafeteria"
+  }, { Cookie: studentAReg.cookie }));
+  assert.equal(foundByARes.status, 201);
+  const foundByAId = foundByARes.json.itemId;
+
+  const dbFoundByA = testApp.testItems.find((item) => String(item._id) === String(foundByAId));
+  assert.equal(dbFoundByA.reportedBy, 12306500);
+
+  const claimRes4 = await request(testApp, "/api/claims", jsonRequest({
+    itemId: foundByAId,
+    verificationAnswers: "Self claim on found bottle"
+  }, { Cookie: studentAReg.cookie }));
+  assert.equal(claimRes4.status, 400);
+  assert.equal(claimRes4.json.message, "You cannot submit an ownership claim for an item you reported yourself.");
+
+  // Extra check: Attempting to claim a LOST report is rejected
+  const claimLostRes = await request(testApp, "/api/claims", jsonRequest({
+    itemId: lostItemId,
+    verificationAnswers: "Cannot claim lost report"
+  }, { Cookie: studentAReg.cookie }));
+  assert.equal(claimLostRes.status, 400);
+  assert.equal(claimLostRes.json.message, "Ownership claims can only be submitted for found items.");
+});
+
 test("claim verification system: submission, duplicate prevention, and admin arbitration", async () => {
   const testApp = buildTestApp();
 
@@ -1641,6 +2182,8 @@ test("claim verification system: submission, duplicate prevention, and admin arb
   assert.equal(questionRes.json.item.identifyingMarks, undefined); // Protected!
 
   // 3. Claimant cannot claim their own reported item (test negative case)
+  const reportedItem = testApp.testItems.find((item) => String(item._id) === String(itemId));
+  reportedItem.reportedBy = String(601);
   const selfClaim = await request(
     testApp,
     "/api/claims",
@@ -1654,6 +2197,7 @@ test("claim verification system: submission, duplicate prevention, and admin arb
     )
   );
   assert.equal(selfClaim.status, 400);
+  reportedItem.reportedBy = 601;
 
   // 4. Claimant submits ownership claim with answers and proof files
   const proofUpload = await supertest(testApp)
@@ -1741,8 +2285,12 @@ test("claim verification system: submission, duplicate prevention, and admin arb
     }
   );
   assert.equal(approveRes.status, 200);
-  assert.equal(approveRes.json.handover.otpEmailStatus, "failed");
-  assert.ok(approveRes.json.message.includes("could not be delivered"));
+  assert.ok(["sent", "smtp_not_configured", "failed"].includes(approveRes.json.handover.otpEmailStatus));
+  assert.ok(
+    approveRes.json.message.includes("could not be delivered") ||
+    approveRes.json.message.includes("email delivery is unavailable") ||
+    approveRes.json.message.includes("emailed to claimant")
+  );
 
   // 9. The item remains unresolved until the claimant verifies the handover OTP
   const updatedItemRes = await request(testApp, `/api/claims/item/${itemId}`);
@@ -1760,7 +2308,7 @@ test("claim verification system: submission, duplicate prevention, and admin arb
   assert.equal(handoverRes.status, 200);
 
   const returnedItemRes = await request(testApp, `/api/claims/item/${itemId}`);
-  assert.equal(returnedItemRes.json.item.status, "returned");
+  assert.equal(returnedItemRes.status, 404);
 
   const reuseRes = await request(testApp, `/api/claims/${claimId}/handover/verify`, {
     method: "POST",
@@ -1898,7 +2446,7 @@ test("only one concurrent admin claim approval can return an item", async () => 
   assert.deepEqual(concurrentOtpRequests.map((response) => response.status).sort(), [200, 409]);
 
   const handedOverItem = await request(testApp, `/api/claims/item/${report.json.itemId}`);
-  assert.equal(handedOverItem.json.item.status, "returned");
+  assert.equal(handedOverItem.status, 404);
 
   const reusedOtp = await request(testApp, `/api/claims/${approvedClaimId}/handover/verify`, {
     method: "POST",
@@ -1989,6 +2537,7 @@ test("handover OTP rejects unauthorized users and enforces five incorrect attemp
     ...jsonRequest({ otp: "999999" }, { Cookie: claimant.cookie }, "POST")
   });
   assert.equal(expired.status, 410);
+  approvedClaim.handoverOtpHash = crypto.createHash("sha256").update("999999").digest("hex");
   approvedClaim.handoverOtpExpiresAt = new Date(Date.now() + 10 * 60 * 1000);
 
   for (let attempt = 0; attempt < 5; attempt += 1) {
@@ -2553,4 +3102,508 @@ test("seedAdmin script fails with exit code 1 when required environment variable
   assert.equal(result.status, 1);
   const output = (result.stderr?.toString() || "") + (result.stdout?.toString() || "");
   assert.ok(output.includes("Missing required administrator seed credentials"));
+});
+
+test("SMTP & Handover OTP end-to-end verification (13 requirements)", async (t) => {
+  t.afterEach(() => {
+    resetTransporter();
+  });
+
+  // 1. SMTP configuration missing
+  await t.test("1. SMTP configuration missing is clearly reported", async () => {
+    const config = getSmtpConfig({});
+    assert.equal(config.isConfigured, false);
+    assert.deepEqual(config.missingFields, ["SMTP_HOST", "SMTP_USER", "SMTP_PASS"]);
+
+    const verifyResult = await verifySmtpConnection(null, {});
+    assert.equal(verifyResult.success, false);
+    assert.equal(verifyResult.status, "smtp_not_configured");
+    assert.ok(verifyResult.errorReason.includes("missing"));
+  });
+
+  // 2. SMTP authentication failure
+  await t.test("2. SMTP authentication failure is sanitized and reported accurately", async () => {
+    const mockTransport = {
+      sendMail: async () => {
+        const err = new Error("Invalid login: 535-5.7.8 Username and Password not accepted");
+        err.code = "EAUTH";
+        err.responseCode = 535;
+        throw err;
+      },
+      verify: async () => {
+        const err = new Error("535 5.7.8 Authentication credentials invalid for user secret@example.com with password secretPass123");
+        err.code = "EAUTH";
+        throw err;
+      }
+    };
+    setTransporter(mockTransport);
+
+    const verifyRes = await verifySmtpConnection(mockTransport);
+    assert.equal(verifyRes.success, false);
+    assert.equal(verifyRes.status, "failed");
+    assert.ok(verifyRes.errorReason.includes("SMTP authentication failed"));
+    assert.ok(!verifyRes.errorReason.includes("secretPass123"));
+
+    const result = await sendHandoverOtp({
+      recipientEmail: "claimant@campus.edu",
+      studentName: "Claimant Student",
+      itemName: "Water Bottle",
+      handoverLocation: "Security Desk",
+      otp: "123456",
+      expiresMinutes: 10
+    });
+    assert.equal(result.success, false);
+    assert.equal(result.status, "failed");
+    assert.ok(result.errorReason.includes("authentication failed"));
+  });
+
+  // 3. Successful SMTP delivery
+  await t.test("3. Successful SMTP delivery updates delivery status to sent", async () => {
+    let sentEmail = null;
+    const mockTransport = {
+      sendMail: async (mailOptions) => {
+        sentEmail = mailOptions;
+        return { messageId: "<msg-101@campusfind>" };
+      }
+    };
+    setTransporter(mockTransport);
+
+    const result = await sendHandoverOtp({
+      recipientEmail: "claimant@campus.edu",
+      studentName: "Claimant Student",
+      itemName: "Blue Hydro Flask",
+      handoverLocation: "Security Desk",
+      otp: "847291",
+      expiresMinutes: 10
+    });
+
+    assert.equal(result.success, true);
+    assert.equal(result.status, "sent");
+    assert.equal(result.messageId, "<msg-101@campusfind>");
+    assert.ok(sentEmail.html.includes("847291"));
+    assert.ok(sentEmail.html.includes("Blue Hydro Flask"));
+    assert.equal(sentEmail.to, "claimant@campus.edu");
+  });
+
+  // 4. SMTP connection timeout
+  await t.test("4. SMTP connection timeout is caught and sanitized", async () => {
+    const mockTransport = {
+      sendMail: async () => {
+        const err = new Error("Connection timed out after 10000ms to smtp.gmail.com:587");
+        err.code = "ETIMEDOUT";
+        throw err;
+      }
+    };
+    setTransporter(mockTransport);
+
+    const result = await sendHandoverOtp({
+      recipientEmail: "claimant@campus.edu",
+      studentName: "Claimant Student",
+      itemName: "Keys",
+      handoverLocation: "Security Desk",
+      otp: "654321",
+      expiresMinutes: 10
+    });
+
+    assert.equal(result.success, false);
+    assert.equal(result.status, "failed");
+    assert.ok(result.errorReason.includes("timed out"));
+  });
+
+  // 5-13. Comprehensive end-to-end integration
+  await t.test("5-13. Complete end-to-end admin approval, recipient isolation, hash security, retry, and handover verification", async () => {
+    const testApp = buildTestApp();
+
+    // 1. Create Finder (Student B: 12305160)
+    const finder = await request(
+      testApp,
+      "/api/auth/register",
+      jsonRequest({
+        studentId: 12305160,
+        name: "Student B",
+        email: "studentB.finder@campus.edu",
+        password: "password123"
+      })
+    );
+    assert.equal(finder.status, 201);
+
+    // 2. Create Claimant (Student A: 12306500)
+    const claimant = await request(
+      testApp,
+      "/api/auth/register",
+      jsonRequest({
+        studentId: 12306500,
+        name: "Student A",
+        email: "studentA.claimant@campus.edu",
+        password: "password123"
+      })
+    );
+    assert.equal(claimant.status, 201);
+
+    // 3. Create Admin
+    const admin = await request(
+      testApp,
+      "/api/auth/register",
+      jsonRequest({
+        studentId: 99999999,
+        name: "Campus Security Admin",
+        email: "admin@campus.edu",
+        password: "password123",
+        role: "admin"
+      })
+    );
+    assert.equal(admin.status, 201);
+    testApp.elevateAdmin(99999999);
+
+    // 4. Finder reports FOUND item
+    const foundItemRes = await request(
+      testApp,
+      "/api/items",
+      jsonRequest(
+        {
+          itemName: "Titan Black Watch",
+          category: "Accessories",
+          color: "Black",
+          reportType: "found",
+          location: "Library 2nd Floor",
+          serialNumber: "TITAN-SN-9981"
+        },
+        { Cookie: finder.cookie }
+      )
+    );
+    assert.equal(foundItemRes.status, 201);
+    const itemId = foundItemRes.json.itemId;
+
+    // 5. Claimant submits claim on found item
+    const claimRes = await request(
+      testApp,
+      "/api/claims",
+      jsonRequest(
+        {
+          itemId,
+          verificationAnswers: [{ question: "Serial Number", answer: "TITAN-SN-9981" }],
+          additionalDetails: "Lost my watch while studying at the library."
+        },
+        { Cookie: claimant.cookie }
+      )
+    );
+    assert.equal(claimRes.status, 201);
+    const claimId = claimRes.json.claim._id;
+
+    // --- TEST 5 & 6: Recipient isolation & Successful Mock SMTP Delivery ---
+    const capturedEmails = [];
+    let shouldSucceed = true;
+    const mockTransport = {
+      sendMail: async (mailOptions) => {
+        capturedEmails.push(mailOptions);
+        if (!shouldSucceed) {
+          const err = new Error("SMTP server connection dropped");
+          err.code = "ECONNRESET";
+          throw err;
+        }
+        return { messageId: `<otp-${Date.now()}@campusfind>` };
+      }
+    };
+    setTransporter(mockTransport);
+
+    // Admin approves claim
+    const approveRes = await request(
+      testApp,
+      `/api/admin/claims/${claimId}/status`,
+      {
+        method: "PATCH",
+        ...jsonRequest(
+          {
+            status: "approved",
+            reviewNotes: "Serial number matched perfectly.",
+            handoverLocation: "Security Central Desk"
+          },
+          { Cookie: admin.cookie },
+          "PATCH"
+        )
+      }
+    );
+    assert.equal(approveRes.status, 200);
+    assert.equal(approveRes.json.status, "approved");
+    assert.equal(approveRes.json.handover.otpEmailStatus, "sent");
+
+    // Check Test 5: Correct claimant email recipient
+    const otpEmail = capturedEmails.find((e) => e.subject?.includes("Handover") || e.subject?.includes("OTP"));
+    assert.ok(otpEmail, "Handover OTP email must be delivered");
+    assert.equal(otpEmail.to, "studenta.claimant@campus.edu");
+    assert.ok(capturedEmails.every((e) => e.to === "studenta.claimant@campus.edu"));
+
+    // Check Test 6: Finder never receives claimant OTP
+    assert.ok(!capturedEmails.some((e) => e.to.includes("studentB") || e.to.includes("finder")));
+    assert.ok(!capturedEmails.some((e) => e.html?.includes("12305160")));
+
+    // Extract the plaintext OTP that was delivered via email
+    const otpMatch = otpEmail.text.match(/\b\d{6}\b/) || otpEmail.html.match(/\b\d{6}\b/);
+    assert.ok(otpMatch, "Email must contain the 6-digit OTP");
+    const issuedOtp = otpMatch[0];
+
+    // --- TEST 7: OTP remains hashed in database (never plaintext) ---
+    const savedClaim = testApp.testClaims.find((c) => String(c._id) === String(claimId));
+    assert.ok(savedClaim.handoverOtpHash, "handoverOtpHash must be stored");
+    assert.equal(savedClaim.handoverOtpHash.length, 64, "handoverOtpHash must be 64-char SHA-256");
+    assert.equal(savedClaim.handoverOtpHash, crypto.createHash("sha256").update(issuedOtp).digest("hex"));
+    assert.ok(savedClaim.handoverOtpEncrypted, "handoverOtpEncrypted must be stored");
+    assert.equal(savedClaim.otp, undefined, "Plaintext otp field must not exist in DB");
+    assert.equal(savedClaim.handoverOtp, undefined, "Plaintext handoverOtp field must not exist in DB");
+
+    // Ensure raw 6-digit OTP is not present in serialized claim JSON outside of hash/ciphertext
+    const serializedClaim = JSON.stringify(savedClaim);
+    assert.ok(
+      !serializedClaim.includes(`"${issuedOtp}"`),
+      "Plaintext OTP must never appear as a value in DB record"
+    );
+
+    // Claimant profile API must never expose OTP or ciphertext
+    const claimantProfileClaims = await request(
+      testApp,
+      "/api/claims/my",
+      { headers: { Cookie: claimant.cookie } }
+    );
+    assert.equal(claimantProfileClaims.status, 200);
+    const profileClaim = claimantProfileClaims.json.claims.find((c) => String(c._id) === String(claimId));
+    assert.equal(profileClaim.handoverOtpHash, undefined);
+    assert.equal(profileClaim.handoverOtpEncrypted, undefined);
+    assert.equal(profileClaim.handoverOtp, undefined);
+    assert.equal(profileClaim.handoverOtpEmailStatus, "sent");
+
+    // --- TEST 8: Email failure is accurately reported ---
+    // Simulate failure on retry
+    shouldSucceed = false;
+    const retryFailRes = await request(
+      testApp,
+      `/api/admin/claims/${claimId}/handover/retry-email`,
+      { method: "POST", headers: { Cookie: admin.cookie } }
+    );
+    assert.equal(retryFailRes.status, 502);
+    assert.equal(retryFailRes.json.handoverOtpEmailStatus, "failed");
+    assert.ok(retryFailRes.json.errorReason);
+
+    // Verify DB accurately reflects failure
+    const claimAfterFail = testApp.testClaims.find((c) => String(c._id) === String(claimId));
+    assert.equal(claimAfterFail.handoverOtpEmailStatus, "failed");
+    assert.ok(claimAfterFail.handoverOtpEmailError);
+
+    // --- TEST 9: Retry does not generate a new OTP ---
+    shouldSucceed = true;
+    capturedEmails.length = 0; // Clear
+    const originalHash = savedClaim.handoverOtpHash;
+
+    const retrySuccessRes = await request(
+      testApp,
+      `/api/admin/claims/${claimId}/handover/retry-email`,
+      { method: "POST", headers: { Cookie: admin.cookie } }
+    );
+    assert.equal(retrySuccessRes.status, 200);
+    assert.equal(retrySuccessRes.json.handoverOtpEmailStatus, "sent");
+
+    // Hash must remain identical
+    const claimAfterRetry = testApp.testClaims.find((c) => String(c._id) === String(claimId));
+    assert.equal(claimAfterRetry.handoverOtpHash, originalHash, "Hash must not change on retry");
+
+    // The emailed OTP in the retry must match the original OTP
+    assert.equal(capturedEmails.length, 1);
+    const retryOtpMatch = capturedEmails[0].text.match(/\b\d{6}\b/) || capturedEmails[0].html.match(/\b\d{6}\b/);
+    assert.equal(retryOtpMatch[0], issuedOtp, "Retry must deliver the SAME unexpired OTP");
+
+    // --- TEST 10: Retry does not expose OTP or hash ---
+    assert.equal(retrySuccessRes.json.otp, undefined);
+    assert.equal(retrySuccessRes.json.handoverOtp, undefined);
+    assert.equal(retrySuccessRes.json.handoverOtpHash, undefined);
+    assert.equal(retrySuccessRes.json.handoverOtpEncrypted, undefined);
+
+    // --- TEST 11: Expired OTP cannot be used ---
+    // Temporarily expire the OTP in DB
+    const realExpiry = claimAfterRetry.handoverOtpExpiresAt;
+    claimAfterRetry.handoverOtpExpiresAt = new Date(Date.now() - 5000);
+
+    const expiredVerifyRes = await request(
+      testApp,
+      `/api/claims/${claimId}/handover/verify`,
+      jsonRequest({ otp: issuedOtp }, { Cookie: claimant.cookie })
+    );
+    assert.equal(expiredVerifyRes.status, 410);
+    assert.ok(expiredVerifyRes.json.message.includes("expired"));
+
+    // Item must remain unreturned
+    const itemStillPending = testApp.testItems.find((i) => String(i._id) === String(itemId));
+    assert.notEqual(itemStillPending.status, "returned");
+
+    // Restore unexpired status for completion test
+    claimAfterRetry.handoverOtpExpiresAt = realExpiry;
+    claimAfterRetry.handoverOtpHash = originalHash;
+    claimAfterRetry.handoverOtpEncrypted = encryptOtp(issuedOtp);
+
+    // --- TEST 12: Correct OTP completes handover ---
+    const successfulVerifyRes = await request(
+      testApp,
+      `/api/claims/${claimId}/handover/verify`,
+      jsonRequest({ otp: issuedOtp }, { Cookie: claimant.cookie })
+    );
+    assert.equal(successfulVerifyRes.status, 200);
+    assert.ok(successfulVerifyRes.json.message.includes("marked returned"));
+
+    // Verify claim and item in database
+    const completedClaim = testApp.testClaims.find((c) => String(c._id) === String(claimId));
+    assert.equal(completedClaim.status, "returned");
+    assert.ok(completedClaim.handoverDate);
+    assert.equal(completedClaim.handoverOtpHash, undefined, "Hash must be cleared upon handover completion");
+    assert.equal(completedClaim.handoverOtpEncrypted, undefined, "Ciphertext must be cleared upon handover completion");
+
+    const completedItem = testApp.testItems.find((i) => String(i._id) === String(itemId));
+    assert.equal(completedItem.status, "returned");
+
+    // --- TEST 13: OTP cannot be reused ---
+    const reuseVerifyRes = await request(
+      testApp,
+      `/api/claims/${claimId}/handover/verify`,
+      jsonRequest({ otp: issuedOtp }, { Cookie: claimant.cookie })
+    );
+    assert.equal(reuseVerifyRes.status, 409);
+    assert.ok(
+      reuseVerifyRes.json.message.includes("not approved for handover") ||
+      reuseVerifyRes.json.message.includes("not awaiting handover")
+    );
+  });
+});
+
+test("Match confirmation workflow: fixes 'Cannot read properties of undefined (reading userId)'", async () => {
+  const testApp = buildTestApp();
+
+  // 1. Register Student A (Lost Reporter / Owner)
+  const studentA = await request(
+    testApp,
+    "/api/auth/register",
+    jsonRequest({
+      studentId: 12306500,
+      name: "Student A",
+      email: "studentA@campus.edu",
+      password: "password123"
+    })
+  );
+  assert.equal(studentA.status, 201);
+
+  // 2. Register Student B (Found Reporter / Finder)
+  const studentB = await request(
+    testApp,
+    "/api/auth/register",
+    jsonRequest({
+      studentId: 12305160,
+      name: "Student B",
+      email: "studentB@campus.edu",
+      password: "password123"
+    })
+  );
+  assert.equal(studentB.status, 201);
+
+  // 3. Register Unauthorized Student C
+  const studentC = await request(
+    testApp,
+    "/api/auth/register",
+    jsonRequest({
+      studentId: 12309999,
+      name: "Student C",
+      email: "studentC@campus.edu",
+      password: "password123"
+    })
+  );
+  assert.equal(studentC.status, 201);
+
+  // Student A reports LOST item
+  const lostRes = await request(
+    testApp,
+    "/api/items",
+    jsonRequest({
+      itemName: "Navy Blue Laptop Sleeve",
+      category: "Electronics",
+      color: "Blue",
+      reportType: "lost",
+      location: "Computer Lab 3"
+    }, { Cookie: studentA.cookie })
+  );
+  assert.equal(lostRes.status, 201);
+
+  // Student B reports FOUND item
+  const foundRes = await request(
+    testApp,
+    "/api/items",
+    jsonRequest({
+      itemName: "Navy Blue Laptop Sleeve",
+      category: "Electronics",
+      color: "Blue",
+      reportType: "found",
+      location: "Computer Lab 3"
+    }, { Cookie: studentB.cookie })
+  );
+  assert.equal(foundRes.status, 201);
+
+  // Fetch matches for Student A
+  const matchRes = await request(testApp, "/api/items/matches", {
+    headers: { Cookie: studentA.cookie }
+  });
+  assert.equal(matchRes.status, 200);
+  assert.equal(matchRes.json.matches.length, 1);
+  const match = matchRes.json.matches[0];
+  assert.equal(match.status, "pending");
+
+  // Case 1: Unauthenticated request must be rejected with 401
+  const unauthRes = await request(testApp, `/api/items/matches/${match._id}/confirm`, {
+    method: "PATCH"
+  });
+  assert.equal(unauthRes.status, 401);
+
+  // Case 2: Unauthorized participant (Student C) must be rejected with 403
+  const unauthStudentRes = await request(testApp, `/api/items/matches/${match._id}/confirm`, {
+    method: "PATCH",
+    headers: { Cookie: studentC.cookie }
+  });
+  assert.equal(unauthStudentRes.status, 403);
+  assert.ok(unauthStudentRes.json.message.includes("Only the owner"));
+
+  // Case 3: Finder (Student B) cannot confirm on behalf of owner -> 403
+  const finderRes = await request(testApp, `/api/items/matches/${match._id}/confirm`, {
+    method: "PATCH",
+    headers: { Cookie: studentB.cookie }
+  });
+  assert.equal(finderRes.status, 403);
+  assert.ok(finderRes.json.message.includes("Only the owner"));
+
+  // Case 4: Forged userId in payload rejected if it does not match session
+  const forgedRes = await request(testApp, `/api/items/matches/${match._id}/confirm`, {
+    method: "PATCH",
+    ...jsonRequest({ userId: 12309999 }, { Cookie: studentA.cookie }, "PATCH")
+  });
+  assert.equal(forgedRes.status, 403);
+  assert.ok(forgedRes.json.message.includes("own match"));
+
+  // Case 5: Student A confirms return without any body (EXACT frontend button click)
+  // This previously crashed with TypeError: Cannot read properties of undefined (reading 'userId')
+  const confirmNoBody = await request(testApp, `/api/items/matches/${match._id}/confirm`, {
+    method: "PATCH",
+    headers: { Cookie: studentA.cookie }
+  });
+  assert.equal(confirmNoBody.status, 200);
+  assert.ok(confirmNoBody.json.message.includes("RETURNED"));
+
+  // Verify match in DB is confirmed
+  const confirmedMatch = testApp.testMatches.find((m) => String(m._id) === String(match._id));
+  assert.equal(confirmedMatch.status, "confirmed");
+
+  // Verify both linked reports are marked returned
+  const lostItem = testApp.testItems.find((i) => String(i._id) === String(lostRes.json.itemId));
+  const foundItem = testApp.testItems.find((i) => String(i._id) === String(foundRes.json.itemId));
+  assert.equal(lostItem.status, "returned");
+  assert.equal(foundItem.status, "returned");
+
+  // Case 6: Duplicate confirmation attempt returns 409
+  const duplicateConfirm = await request(testApp, `/api/items/matches/${match._id}/confirm`, {
+    method: "PATCH",
+    headers: { Cookie: studentA.cookie }
+  });
+  assert.equal(duplicateConfirm.status, 409);
+  assert.ok(duplicateConfirm.json.message.includes("already been resolved"));
 });

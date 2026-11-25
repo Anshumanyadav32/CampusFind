@@ -144,8 +144,16 @@ const claimSchema = new mongoose.Schema(
     },
     handoverOtpEmailStatus: {
       type: String,
-      enum: ["pending", "sent", "failed"],
+      enum: ["pending", "sent", "failed", "smtp_not_configured"],
       default: "pending"
+    },
+    handoverOtpEmailError: {
+      type: String,
+      default: ""
+    },
+    handoverOtpEncrypted: {
+      type: String,
+      default: null
     },
     handoverConfirmedBy: {
       type: mongoose.Schema.Types.Mixed,

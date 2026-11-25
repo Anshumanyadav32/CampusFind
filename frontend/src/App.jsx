@@ -81,6 +81,7 @@ function App() {
   const [submitting, setSubmitting] = useState(false);
   const [notice, setNotice] = useState("");
   const [noticeType, setNoticeType] = useState("success");
+  const [confirmingMatchId, setConfirmingMatchId] = useState(null);
 
   // Synchronize browser history / popstate
   useEffect(() => {
@@ -95,8 +96,8 @@ function App() {
     return () => window.removeEventListener("popstate", handlePopState);
   }, []);
 
-  const loadItems = useCallback(async () => {
-    const params = { page, pageSize: PAGE_SIZE };
+  const loadItems = useCallback(async (requestedPage = page) => {
+    const params = { page: requestedPage, pageSize: PAGE_SIZE };
     if (activeTab !== "all") {
       params.reportType = activeTab;
     }
@@ -111,10 +112,11 @@ function App() {
     return response.data;
   }, [activeTab, category, debouncedSearch, page]);
 
-  const fetchItems = useCallback(async () => {
+  const fetchItems = useCallback(async (requestedPage = page) => {
+    const pageToLoad = Number.isInteger(requestedPage) ? requestedPage : page;
     setLoading(true);
     try {
-      const data = await loadItems();
+      const data = await loadItems(pageToLoad);
       setItems(data.items);
       setTotalItems(data.total);
       setTotalPages(data.totalPages);
@@ -127,7 +129,7 @@ function App() {
     } finally {
       setLoading(false);
     }
-  }, [loadItems]);
+  }, [loadItems, page]);
 
   async function fetchProfile() {
     setProfileLoading(true);
@@ -150,6 +152,11 @@ function App() {
     } finally {
       setProfileLoading(false);
     }
+  }
+
+  async function refreshAfterResolution() {
+    if (page !== 1) setPage(1);
+    await Promise.all([fetchProfile(), fetchItems(1)]);
   }
 
   async function openProfile() {
@@ -189,21 +196,37 @@ function App() {
   }
 
   async function confirmMatch(match) {
+    if (!match?._id) return;
+    if (confirmingMatchId) return;
+
     const confirming = match.status === "confirming";
     const question = confirming
       ? "Resume marking these reports as returned?"
       : "Confirm that the lost item was returned to you?";
     if (!window.confirm(question)) return;
 
+    setConfirmingMatchId(match._id);
     try {
-      const response = await axios.patch(`${API}/matches/${match._id}/confirm`);
+      const response = await axios.patch(
+        `${API}/matches/${encodeURIComponent(match._id)}/confirm`,
+        {}
+      );
       setNoticeType("success");
-      setNotice(response.data.message);
-      await fetchProfile();
+      setNotice(response.data.message || "Item return confirmed successfully!");
+      await refreshAfterResolution();
     } catch (err) {
-      setNoticeType("error");
-      setNotice(err.response?.data?.message || "Could not confirm this match.");
-      await fetchProfile();
+      if (err.response?.status === 401) {
+        setNoticeType("error");
+        setNotice("Your session has expired. Please sign in again.");
+        setCurrentUser(null);
+        setShowAuth(true);
+      } else {
+        setNoticeType("error");
+        setNotice(err.response?.data?.message || "Could not confirm this match.");
+      }
+      await refreshAfterResolution();
+    } finally {
+      setConfirmingMatchId(null);
     }
   }
 
@@ -396,16 +419,17 @@ function App() {
   async function logout() {
     try {
       await axios.post(`${AUTH_API}/logout`);
+      setNoticeType("success");
+      setNotice("Signed out successfully.");
+    } catch {
+      setNoticeType("info");
+      setNotice("Signed out.");
+    } finally {
       setCurrentUser(null);
       window.history.pushState({}, "", "/");
       setActivePage("home");
       setProfileData(null);
       setForm((previous) => ({ ...previous, reportedBy: "" }));
-      setNoticeType("success");
-      setNotice("Signed out successfully.");
-    } catch {
-      setNoticeType("error");
-      setNotice("Could not sign out right now.");
     }
   }
 
@@ -511,11 +535,12 @@ function App() {
           profileSaving={profileSaving}
           currentUser={currentUser}
           confirmMatch={confirmMatch}
+          confirmingMatchId={confirmingMatchId}
           onOpenDispute={(match) => setDisputeMatch(match)}
           onWithdrawClaim={handleWithdrawClaim}
           API_BASE_URL={API_BASE_URL}
           onHandoverSuccess={async () => {
-            await fetchProfile();
+            await refreshAfterResolution();
           }}
           openReport={openReport}
           openProfile={openProfile}

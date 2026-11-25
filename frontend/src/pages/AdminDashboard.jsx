@@ -26,6 +26,7 @@ export default function AdminDashboard({
   const [claimReviewNotes, setClaimReviewNotes] = useState("");
   const [claimRejectionReason, setClaimRejectionReason] = useState("");
   const [claimHandoverLocation, setClaimHandoverLocation] = useState("Campus Security Central Desk");
+  const [retryEmailLoading, setRetryEmailLoading] = useState(false);
 
   // User Management
   const [users, setUsers] = useState([]);
@@ -218,6 +219,39 @@ export default function AdminDashboard({
       setActionNotice(err.response?.data?.message || "Could not update claim status.");
     } finally {
       setClaimActionLoading(false);
+    }
+  }
+
+  // Handle Retry Handover OTP Email
+  async function handleRetryOtpEmail() {
+    if (!selectedClaim) return;
+    setRetryEmailLoading(true);
+    setActionNotice("");
+
+    try {
+      const res = await axios.post(`${API_BASE_URL}/admin/claims/${selectedClaim._id}/handover/retry-email`);
+      setActionNoticeType("success");
+      setActionNotice(res.data.message || "Handover OTP email sent successfully.");
+      setSelectedClaim((prev) => (prev ? {
+        ...prev,
+        handoverOtpEmailStatus: res.data.handoverOtpEmailStatus || "sent",
+        handoverOtpEmailError: ""
+      } : null));
+      await loadClaims();
+    } catch (err) {
+      setActionNoticeType("error");
+      const errorMsg = err.response?.data?.message || "Failed to retry OTP email delivery.";
+      setActionNotice(errorMsg);
+      if (err.response?.data?.handoverOtpEmailStatus) {
+        setSelectedClaim((prev) => (prev ? {
+          ...prev,
+          handoverOtpEmailStatus: err.response.data.handoverOtpEmailStatus,
+          handoverOtpEmailError: err.response.data.errorReason || errorMsg
+        } : null));
+      }
+      await loadClaims();
+    } finally {
+      setRetryEmailLoading(false);
     }
   }
 
@@ -671,6 +705,31 @@ export default function AdminDashboard({
                         >
                           {claim.status.replace("_", " ").toUpperCase()}
                         </span>
+                        {claim.status === "approved" && (
+                          <small
+                            style={{
+                              display: "block",
+                              marginTop: "2px",
+                              fontSize: "11px",
+                              fontWeight: "600",
+                              color:
+                                claim.handoverOtpEmailStatus === "sent"
+                                  ? "#274029"
+                                  : claim.handoverOtpEmailStatus === "failed" ||
+                                    claim.handoverOtpEmailStatus === "smtp_not_configured"
+                                    ? "#b12d2d"
+                                    : "#b18c38"
+                            }}
+                          >
+                            OTP: {claim.handoverOtpEmailStatus === "sent"
+                              ? "Sent"
+                              : claim.handoverOtpEmailStatus === "failed"
+                                ? "Failed"
+                                : claim.handoverOtpEmailStatus === "smtp_not_configured"
+                                  ? "SMTP Not Configured"
+                                  : "Pending"}
+                          </small>
+                        )}
                         <button
                           className="button button-dark"
                           onClick={() => {
@@ -723,14 +782,52 @@ export default function AdminDashboard({
                       )}
 
                       {selectedClaim.status === "approved" && (
-                        <p>
-                          <strong>Handover OTP email:</strong>{" "}
-                          {selectedClaim.handoverOtpEmailStatus === "sent"
-                            ? "Sent to the verified claimant"
-                            : selectedClaim.handoverOtpEmailStatus === "failed"
-                              ? "Delivery failed - configure or retry email delivery"
-                              : "Issuance pending"}
-                        </p>
+                        <div style={{ margin: "10px 0", padding: "10px 12px", background: "#f1f3f0", borderRadius: "6px", border: "1px solid #e0e3de" }}>
+                          <p style={{ margin: "0 0 4px 0" }}>
+                            <strong>Handover OTP Delivery Status:</strong>{" "}
+                            <span
+                              style={{
+                                fontWeight: "bold",
+                                color:
+                                  selectedClaim.handoverOtpEmailStatus === "sent"
+                                    ? "#274029"
+                                    : selectedClaim.handoverOtpEmailStatus === "failed" ||
+                                      selectedClaim.handoverOtpEmailStatus === "smtp_not_configured"
+                                      ? "#b12d2d"
+                                      : "#b18c38"
+                              }}
+                            >
+                              {selectedClaim.handoverOtpEmailStatus === "sent"
+                                ? "Sent"
+                                : selectedClaim.handoverOtpEmailStatus === "failed"
+                                  ? "Failed"
+                                  : selectedClaim.handoverOtpEmailStatus === "smtp_not_configured"
+                                    ? "SMTP Not Configured"
+                                    : "Pending"}
+                            </span>
+                          </p>
+                          {selectedClaim.handoverOtpEmailError && (
+                            <p style={{ margin: "4px 0", fontSize: "12px", color: "#b12d2d" }}>
+                              <strong>Failure Reason:</strong> {selectedClaim.handoverOtpEmailError}
+                            </p>
+                          )}
+                          {selectedClaim.handoverOtpEmailStatus === "smtp_not_configured" && (
+                            <p style={{ margin: "4px 0", fontSize: "12px", color: "#666" }}>
+                              SMTP settings are missing. Configure <code>SMTP_HOST</code>, <code>SMTP_PORT</code>, <code>SMTP_USER</code>, and <code>SMTP_PASS</code> in <code>backend/.env</code>.
+                            </p>
+                          )}
+                          {["failed", "smtp_not_configured", "pending"].includes(selectedClaim.handoverOtpEmailStatus) && (
+                            <button
+                              type="button"
+                              className="button button-outline"
+                              onClick={handleRetryOtpEmail}
+                              disabled={retryEmailLoading}
+                              style={{ marginTop: "6px", fontSize: "12px", padding: "5px 10px" }}
+                            >
+                              {retryEmailLoading ? "Retrying..." : "Retry OTP Email ↻"}
+                            </button>
+                          )}
+                        </div>
                       )}
                       {selectedClaim.status === "returned" && (
                         <p><strong>Handover completed:</strong> {selectedClaim.handoverDate ? new Date(selectedClaim.handoverDate).toLocaleString("en-IN") : "Timestamp unavailable"}</p>

@@ -48,8 +48,12 @@ import {
   notifyClaimStatusChange,
   notifyAdminResolution,
   sendVerificationOtp,
-  sendHandoverOtp
+  sendHandoverOtp,
+  getSmtpConfig,
+  verifySmtpConnection,
+  sanitizeSmtpError
 } from "./services/emailService.js";
+import { encryptOtp, decryptOtp } from "./utils/encryption.js";
 
 dotenv.config();
 
@@ -196,10 +200,47 @@ function isPubliclyVisibleItem(item) {
   return Boolean(item && (item.moderationStatus === undefined || item.moderationStatus === null || item.moderationStatus === "active"));
 }
 
+function compareItemReporterToUser(reportedBy, user) {
+  if (reportedBy === undefined || reportedBy === null || reportedBy === "") return null;
+
+  const reporterStudentId = parseStudentId(reportedBy);
+  if (reporterStudentId !== null) {
+    const authenticatedStudentId = parseStudentId(user?.studentId);
+    return authenticatedStudentId === null ? null : reporterStudentId === authenticatedStudentId;
+  }
+
+  let reporterObjectId;
+  if (reportedBy instanceof mongoose.Types.ObjectId) {
+    reporterObjectId = reportedBy;
+  } else if (typeof reportedBy === "string" && mongoose.isValidObjectId(reportedBy)) {
+    reporterObjectId = new mongoose.Types.ObjectId(reportedBy);
+  } else if (
+    reportedBy && typeof reportedBy === "object"
+    && typeof reportedBy.$oid === "string"
+    && mongoose.isValidObjectId(reportedBy.$oid)
+  ) {
+    reporterObjectId = new mongoose.Types.ObjectId(reportedBy.$oid);
+  } else {
+    return null;
+  }
+
+  const userId = user?._id ?? user?.id;
+  if (!userId) return null;
+
+  if (userId instanceof mongoose.Types.ObjectId) {
+    return reporterObjectId.equals(userId);
+  }
+  if (typeof userId === "string" && mongoose.isValidObjectId(userId)) {
+    return reporterObjectId.equals(new mongoose.Types.ObjectId(userId));
+  }
+  return String(reporterObjectId) === String(userId);
+}
+
 function sanitizeStudentClaim(claim) {
   if (!claim) return null;
   const {
     handoverOtpHash,
+    handoverOtpEncrypted,
     handoverOtpExpiresAt,
     handoverOtpAttempts,
     riskScore,
@@ -216,7 +257,7 @@ function sanitizeStudentClaim(claim) {
 
 function sanitizeAdminClaim(claim) {
   if (!claim) return null;
-  const { handoverOtpHash, handoverOtpExpiresAt, handoverOtpAttempts, ...adminClaim } = claim;
+  const { handoverOtpHash, handoverOtpEncrypted, handoverOtpExpiresAt, handoverOtpAttempts, ...adminClaim } = claim;
   return {
     ...adminClaim,
     handoverOtpActive: Boolean(claim.handoverOtpHash && claim.handoverOtpExpiresAt && new Date(claim.handoverOtpExpiresAt).getTime() > Date.now()),
@@ -498,101 +539,236 @@ export async function createMatchesForItem(item, itemId, collectionFactory) {
   return matchesCreated;
 }
 
-async function completeMatchConfirmation(match, itemsCollection, matchesCollection, confirmedByStudentId) {
-  const matchUpdate = await matchesCollection().updateOne(
-    { _id: match._id, status: "confirming" },
+async function completeMatchConfirmation(
+  match,
+  itemsCollection,
+  matchesCollection,
+  claimsCollection,
+  confirmedByStudentId
+) {
+  const now = new Date();
+  const actorId = parseStudentId(confirmedByStudentId || match.confirmedBy || match.lostReportedBy);
+  const lockToken = crypto.randomUUID();
+  const lockResult = await matchesCollection().updateOne(
+    {
+      _id: match._id,
+      status: "confirming",
+      confirmedBy: actorId,
+      $or: [
+        { confirmationLockUntil: { $exists: false } },
+        { confirmationLockUntil: null },
+        { confirmationLockUntil: { $lte: now } }
+      ]
+    },
     {
       $set: {
-        status: "confirmed",
-        confirmedAt: new Date()
-      },
-      $push: {
-        claimHistory: {
-          action: "confirmed",
-          performedBy: Number(confirmedByStudentId || match.lostReportedBy),
-          role: "student",
-          details: "Handover confirmed. Item marked as returned.",
-          timestamp: new Date()
-        }
+        confirmationLockToken: lockToken,
+        confirmationLockUntil: new Date(now.getTime() + 2 * 60 * 1000)
       }
     }
   );
-  if (matchUpdate.matchedCount !== 1) {
-    return false;
+  if (lockResult.matchedCount !== 1) {
+    return { ok: false, reason: "busy" };
   }
 
-  const itemIds = [match.lostItemId, match.foundItemId];
-  const reservedItems = [];
-  const originalStatuses = new Map();
+  const reportFailure = (reason, failedUpdate, result, states = {}) => {
+    console.error("[MatchConfirmation] Recovery step failed.", JSON.stringify({
+      matchId: String(match._id),
+      lostReportId: String(match.lostItemId),
+      foundReportId: String(match.foundItemId),
+      failedUpdate,
+      matchedCount: result?.matchedCount ?? null,
+      modifiedCount: result?.modifiedCount ?? null,
+      currentConfirmationState: "confirming",
+      lostReportState: states.lostReportState ?? null,
+      foundReportState: states.foundReportState ?? null,
+      reason
+    }));
+    return { ok: false, reason };
+  };
 
-  for (const itemId of itemIds) {
-    const item = await itemsCollection().findOne({ _id: itemId });
-    if (!item) {
-      for (const reserved of reservedItems) {
-        await itemsCollection().updateOne(
-          { _id: reserved._id, status: "returned", approvedMatchId: match._id },
-          {
-            $set: { status: originalStatuses.get(String(reserved._id)) || reserved.status },
-            $unset: { approvedMatchId: "" }
-          }
-        );
-      }
-      await matchesCollection().updateOne(
-        { _id: match._id, status: "confirmed" },
-        { $set: { status: "confirming" } }
-      );
-      return false;
+  const asIdSelector = (value) => {
+    if (value === undefined || value === null || value === "") return null;
+    return createIdSelector(String(value));
+  };
+  const lostItemSelector = asIdSelector(match.lostItemId);
+  const foundItemSelector = asIdSelector(match.foundItemId);
+
+  try {
+    if (!actorId || !lostItemSelector || !foundItemSelector || String(lostItemSelector) === String(foundItemSelector)) {
+      return reportFailure("invalid linked report identifiers", "validate-linked-report-ids");
     }
 
-    if (["returned", "closed"].includes(item.status) || !["active", null, undefined].includes(item.moderationStatus)) {
-      for (const reserved of reservedItems) {
-        await itemsCollection().updateOne(
-          { _id: reserved._id, status: "returned", approvedMatchId: match._id },
-          {
-            $set: { status: originalStatuses.get(String(reserved._id)) || reserved.status },
-            $unset: { approvedMatchId: "" }
-          }
-        );
-      }
-      await matchesCollection().updateOne(
-        { _id: match._id, status: "confirmed" },
-        { $set: { status: "confirming" } }
+    const [lostItem, foundItem] = await Promise.all([
+      itemsCollection().findOne({ _id: lostItemSelector }),
+      itemsCollection().findOne({ _id: foundItemSelector })
+    ]);
+
+    if (!lostItem || !foundItem) {
+      return reportFailure(
+        !lostItem ? "lost report missing" : "found report missing",
+        !lostItem ? "load-lost-report" : "load-found-report",
+        null,
+        { lostReportState: lostItem?.status, foundReportState: foundItem?.status }
       );
-      return false;
     }
 
-    const reservation = await itemsCollection().updateOne(
+    if (
+      normalize(lostItem.reportType) !== "lost"
+      || normalize(foundItem.reportType) !== "found"
+      || parseStudentId(lostItem.reportedBy) !== parseStudentId(match.lostReportedBy)
+      || parseStudentId(foundItem.reportedBy) !== parseStudentId(match.foundReportedBy)
+    ) {
+      return reportFailure(
+        "linked report types or reporter identities do not match the match record",
+        "validate-linked-report-ownership",
+        null,
+        { lostReportState: lostItem.status, foundReportState: foundItem.status }
+      );
+    }
+
+    const isCompletedClaimReturn = async (item) => {
+      if (!item.approvedClaimId) return false;
+      const claimSelector = asIdSelector(item.approvedClaimId);
+      if (!claimSelector) return false;
+      const claim = await claimsCollection().findOne({ _id: claimSelector });
+      return Boolean(
+        claim
+        && String(claim.itemId) === String(item._id)
+        && parseStudentId(claim.claimantId) === actorId
+        && claim.status === "returned"
+        && claim.handoverDate
+        && parseStudentId(claim.handoverConfirmedBy) === actorId
+      );
+    };
+
+    const isResolvedForThisMatch = async (item) => {
+      if (item.status !== "returned") return false;
+      if (item.approvedMatchId && String(item.approvedMatchId) === String(match._id)) return true;
+      return isCompletedClaimReturn(item);
+    };
+
+    for (const item of [lostItem, foundItem]) {
+      if (await isResolvedForThisMatch(item)) {
+        continue;
+      }
+
+      if (
+        item.status === "returned"
+        || item.status === "closed"
+        || !["active", null, undefined].includes(item.moderationStatus)
+      ) {
+        return reportFailure(
+          "report is already resolved or moderated outside this match",
+          `reserve-${normalize(item.reportType)}-report`,
+          null,
+          { lostReportState: lostItem.status, foundReportState: foundItem.status }
+        );
+      }
+
+      const reservation = await itemsCollection().updateOne(
+        {
+          _id: item._id,
+          status: { $nin: ["returned", "closed"] },
+          approvedClaimId: { $in: [null] },
+          approvedMatchId: { $in: [null] },
+          moderationStatus: { $in: ["active", null] }
+        },
+        {
+          $set: {
+            status: "returned",
+            approvedMatchId: match._id,
+            updatedAt: new Date()
+          }
+        }
+      );
+
+      if (reservation.matchedCount !== 1) {
+        const latest = await itemsCollection().findOne({ _id: item._id });
+        if (latest && await isResolvedForThisMatch(latest)) {
+          continue;
+        }
+        return reportFailure(
+          "conditional report update did not match",
+          `reserve-${normalize(item.reportType)}-report`,
+          reservation,
+          { lostReportState: lostItem.status, foundReportState: foundItem.status }
+        );
+      }
+    }
+
+    const [verifiedLost, verifiedFound] = await Promise.all([
+      itemsCollection().findOne({ _id: lostItemSelector }),
+      itemsCollection().findOne({ _id: foundItemSelector })
+    ]);
+    if (
+      !verifiedLost || !verifiedFound
+      || !(await isResolvedForThisMatch(verifiedLost))
+      || !(await isResolvedForThisMatch(verifiedFound))
+    ) {
+      return reportFailure(
+        "final report state verification failed",
+        "verify-final-report-states",
+        null,
+        { lostReportState: verifiedLost?.status, foundReportState: verifiedFound?.status }
+      );
+    }
+
+    const finalized = await matchesCollection().updateOne(
+      { _id: match._id, status: "confirming", confirmationLockToken: lockToken },
       {
-        _id: item._id,
-        status: { $nin: ["returned", "closed"] },
-        approvedMatchId: { $in: [null] },
-        moderationStatus: { $in: ["active", null] }
-      },
-      { $set: { status: "returned", approvedMatchId: match._id, updatedAt: new Date() } }
-    );
-
-    if (reservation.matchedCount !== 1) {
-      for (const reserved of reservedItems) {
-        await itemsCollection().updateOne(
-          { _id: reserved._id, status: "returned", approvedMatchId: match._id },
-          {
-            $set: { status: originalStatuses.get(String(reserved._id)) || reserved.status },
-            $unset: { approvedMatchId: "" }
+        $set: {
+          status: "confirmed",
+          confirmedAt: new Date()
+        },
+        $unset: {
+          confirmationLockToken: "",
+          confirmationLockUntil: ""
+        },
+        $push: {
+          claimHistory: {
+            action: "confirmed",
+            performedBy: actorId,
+            role: "student",
+            details: "Handover confirmed. Linked reports verified as returned.",
+            timestamp: new Date()
           }
-        );
+        }
       }
-      await matchesCollection().updateOne(
-        { _id: match._id, status: "confirmed" },
-        { $set: { status: "confirming" } }
-      );
-      return false;
+    );
+    if (finalized.matchedCount !== 1) {
+      const latestMatch = await matchesCollection().findOne({ _id: match._id });
+      if (latestMatch?.status === "confirmed") return { ok: true, alreadyCompleted: true };
+      return reportFailure("match finalization did not match the active recovery lease", "finalize-match", finalized);
     }
 
-    originalStatuses.set(String(item._id), item.status);
-    reservedItems.push(item);
+    return { ok: true, alreadyCompleted: false };
+  } catch (error) {
+    console.error("[MatchConfirmation] Recovery operation raised an error.", JSON.stringify({
+      matchId: String(match._id),
+      lostReportId: String(match.lostItemId),
+      foundReportId: String(match.foundItemId),
+      failedUpdate: "confirmation-recovery",
+      matchedCount: null,
+      modifiedCount: null,
+      currentConfirmationState: "confirming",
+      errorName: error?.name || "Error"
+    }));
+    return { ok: false, reason: "database operation failed" };
+  } finally {
+    await matchesCollection().updateOne(
+      { _id: match._id, status: "confirming", confirmationLockToken: lockToken },
+      { $unset: { confirmationLockToken: "", confirmationLockUntil: "" } }
+    ).catch((error) => {
+      console.error("[MatchConfirmation] Could not release recovery lease.", JSON.stringify({
+        matchId: String(match._id),
+        lostReportId: String(match.lostItemId),
+        foundReportId: String(match.foundItemId),
+        currentConfirmationState: "confirming",
+        errorName: error.name
+      }));
+    });
   }
-
-  return true;
 }
 
 export function createApp(collectionFactory = {}) {
@@ -972,6 +1148,7 @@ export function createApp(collectionFactory = {}) {
 
       // Legacy records without moderationStatus remain visible; only active reports are public.
       conditions.push({ moderationStatus: { $in: ["active", null] } });
+      conditions.push({ status: { $nin: ["returned", "closed"] } });
 
       const filter = conditions.length ? { $and: conditions } : {};
       const collection = itemsCollection();
@@ -1780,7 +1957,7 @@ export function createApp(collectionFactory = {}) {
             $match: {
               $and: [
                 filter,
-                { status: { $ne: "duplicate" } }
+                { status: { $nin: ["duplicate", "confirmed"] } }
               ]
             }
           },
@@ -1812,12 +1989,24 @@ export function createApp(collectionFactory = {}) {
               preserveNullAndEmptyArrays: true
             }
           },
+          {
+            $match: {
+              $or: [
+                { "lostItem.status": { $ne: "returned" } },
+                { "foundItem.status": { $ne: "returned" } }
+              ]
+            }
+          },
           { $sort: { createdAt: -1 } }
         ])
         .toArray();
 
       const visibleMatches = matches
-        .filter((match) => isPubliclyVisibleItem(match.lostItem) && isPubliclyVisibleItem(match.foundItem))
+        .filter((match) =>
+          isPubliclyVisibleItem(match.lostItem)
+          && isPubliclyVisibleItem(match.foundItem)
+          && !(match.lostItem.status === "returned" && match.foundItem.status === "returned")
+        )
         .map((match) => ({
           _id: match._id,
           lostItemId: match.lostItemId,
@@ -1980,7 +2169,6 @@ export function createApp(collectionFactory = {}) {
   app.patch("/api/items/matches/:id/confirm", requireStudent(usersCollection), async (req, res) => {
     try {
       const { id } = req.params;
-      const providedUserId = parseStudentId(req.body.userId ?? req.userId);
       const matchIdSelector = createIdSelector(id);
 
       if (!matchIdSelector) {
@@ -1989,7 +2177,12 @@ export function createApp(collectionFactory = {}) {
         });
       }
 
-      if (providedUserId === null || providedUserId !== req.userId) {
+      const authStudentId = req.userId;
+      const submittedUserId = req.body?.userId !== undefined
+        ? parseStudentId(req.body.userId)
+        : authStudentId;
+
+      if (submittedUserId === null || submittedUserId !== authStudentId) {
         return res.status(403).json({
           message: "You can only confirm your own match."
         });
@@ -2005,7 +2198,7 @@ export function createApp(collectionFactory = {}) {
         });
       }
 
-      if (providedUserId !== match.lostReportedBy) {
+      if (parseStudentId(match.lostReportedBy) !== authStudentId) {
         return res.status(403).json({
           message: "Only the owner can verify this item."
         });
@@ -2021,14 +2214,14 @@ export function createApp(collectionFactory = {}) {
         return res.status(409).json({ message: "This match cannot be confirmed in its current state." });
       }
 
-      if (match.status === "confirming" && match.confirmedBy !== providedUserId) {
+      if (match.status === "confirming" && match.confirmedBy != null && parseStudentId(match.confirmedBy) !== authStudentId) {
         return res.status(403).json({ message: "Only the owner can resume this confirmation." });
       }
 
       if (match.status === "pending") {
         const auditEvent = {
           action: "claim_initiated",
-          performedBy: providedUserId,
+          performedBy: authStudentId,
           role: "student",
           details: "Owner initiated item verification confirmation.",
           timestamp: new Date()
@@ -2039,7 +2232,7 @@ export function createApp(collectionFactory = {}) {
           {
             $set: {
               status: "confirming",
-              confirmedBy: providedUserId,
+              confirmedBy: authStudentId,
               confirmationStartedAt: new Date()
             },
             $push: { claimHistory: auditEvent }
@@ -2048,21 +2241,51 @@ export function createApp(collectionFactory = {}) {
         if (claimed.modifiedCount !== 1) {
           const currentMatch = await matchesCollection().findOne({ _id: matchIdSelector });
           if (currentMatch?.status === "confirmed") {
-            return res.json({ message: "This item has already been marked as returned." });
+            return res.status(409).json({ message: "This match has already been resolved." });
           }
           if (
             currentMatch?.status !== "confirming"
-            || currentMatch.confirmedBy !== providedUserId
+            || parseStudentId(currentMatch.confirmedBy) !== authStudentId
           ) {
             return res.status(409).json({ message: "This match is being updated. Please retry." });
           }
         }
       }
 
+      if (match.status === "confirming" && match.confirmedBy == null) {
+        const assigned = await matchesCollection().updateOne(
+          { _id: matchIdSelector, status: "confirming", confirmedBy: { $in: [null] } },
+          { $set: { confirmedBy: authStudentId, confirmationStartedAt: match.confirmationStartedAt || new Date() } }
+        );
+        if (assigned.matchedCount !== 1) {
+          return res.status(409).json({ message: "This confirmation is being recovered by another request. Retry shortly." });
+        }
+      }
+
       const currentMatch = await matchesCollection().findOne({ _id: matchIdSelector });
-      if (!currentMatch || !(await completeMatchConfirmation(currentMatch, itemsCollection, matchesCollection, providedUserId))) {
+      const completion = currentMatch
+        ? await completeMatchConfirmation(
+            currentMatch,
+            itemsCollection,
+            matchesCollection,
+            claimsCollection,
+            authStudentId
+          )
+        : { ok: false, reason: "match disappeared" };
+      if (!completion.ok) {
+        if (completion.reason !== "busy") {
+          console.error("[MatchConfirmation] Confirmation remains recoverable.", JSON.stringify({
+            matchId: String(match._id),
+            lostReportId: String(match.lostItemId),
+            foundReportId: String(match.foundItemId),
+            failure: completion.reason,
+            currentConfirmationState: "confirming"
+          }));
+        }
         return res.status(409).json({
-          message: "The linked reports could not both be updated. Retry confirmation to resume."
+          message: completion.reason === "busy"
+            ? "This confirmation is already being processed. Retry shortly."
+            : "The confirmation is incomplete and remains recoverable. Retry or contact campus administration."
         });
       }
 
@@ -2132,11 +2355,23 @@ export function createApp(collectionFactory = {}) {
         return res.status(404).json({ message: "The item you are claiming is not available." });
       }
 
-      if (targetItem.status === "returned") {
+      if (["returned", "closed"].includes(targetItem.status)) {
         return res.status(400).json({ message: "This item has already been marked as returned to its owner." });
       }
 
-      if (targetItem.reportedBy === req.userId) {
+      if (targetItem.reportType !== "found") {
+        return res.status(400).json({ message: "Ownership claims can only be submitted for found items." });
+      }
+
+      const reporterIsCurrentUser = compareItemReporterToUser(targetItem.reportedBy, req.currentUser);
+      if (reporterIsCurrentUser === null) {
+        console.warn(`[Claims] Reporter verification failed: missing or invalid reporter identity for item ${targetItem._id}.`);
+        return res.status(409).json({
+          message: "The item's reporter identity cannot be verified. Please contact campus administration."
+        });
+      }
+
+      if (reporterIsCurrentUser) {
         return res.status(400).json({ message: "You cannot submit an ownership claim for an item you reported yourself." });
       }
 
@@ -2310,6 +2545,9 @@ export function createApp(collectionFactory = {}) {
       if (!isPubliclyVisibleItem(item)) {
         return res.status(404).json({ message: "Item not found." });
       }
+      if (["returned", "closed"].includes(item.status)) {
+        return res.status(404).json({ message: "Item not found." });
+      }
 
       const questions = Array.isArray(item.verificationQuestions) && item.verificationQuestions.length > 0
         ? item.verificationQuestions
@@ -2351,7 +2589,7 @@ export function createApp(collectionFactory = {}) {
       if (new Date(claim.handoverOtpExpiresAt).getTime() <= Date.now()) {
         await claimsCollection().updateOne(
           { _id: claimSelector },
-          { $unset: { handoverOtpHash: "", handoverOtpExpiresAt: "" }, $set: { handoverOtpAttempts: 0 } }
+          { $unset: { handoverOtpHash: "", handoverOtpExpiresAt: "", handoverOtpEncrypted: "" }, $set: { handoverOtpAttempts: 0 } }
         );
         return res.status(410).json({ message: "The handover OTP has expired." });
       }
@@ -2385,7 +2623,7 @@ export function createApp(collectionFactory = {}) {
             reviewedAt: new Date(),
             updatedAt: new Date()
           },
-          $unset: { handoverOtpHash: "", handoverOtpExpiresAt: "" },
+          $unset: { handoverOtpHash: "", handoverOtpExpiresAt: "", handoverOtpEncrypted: "" },
           $push: {
             claimHistory: {
               action: "handover_confirmed",
@@ -2929,17 +3167,24 @@ export function createApp(collectionFactory = {}) {
         const handoverOtp = generateSecureOtp();
         const expiryMinutes = Math.max(1, Number(process.env.HANDOVER_OTP_EXPIRY_MINUTES || 10));
         updatePayload.handoverOtpHash = sha256(handoverOtp);
+        updatePayload.handoverOtpEncrypted = encryptOtp(handoverOtp);
         updatePayload.handoverOtpExpiresAt = new Date(Date.now() + expiryMinutes * 60 * 1000);
         updatePayload.handoverOtpAttempts = 0;
         updatePayload.handoverOtpIssuedAt = new Date();
 
-        const otpEmailDelivered = await sendHandoverOtp({
-          recipientEmail: claim.claimantEmail,
-          studentName: claim.claimantName,
+        const claimantUser = await usersCollection().findOne({ studentId: claim.claimantId });
+        const recipientEmail = claimantUser?.email || claim.claimantEmail;
+
+        const emailResult = await sendHandoverOtp({
+          recipientEmail,
+          studentName: claimantUser?.name || claim.claimantName,
+          itemName: targetItem?.itemName || "Reported Item",
+          handoverLocation: updatePayload.handoverLocation,
           otp: handoverOtp,
           expiresMinutes: expiryMinutes
         });
-        updatePayload.handoverOtpEmailStatus = otpEmailDelivered ? "sent" : "failed";
+        updatePayload.handoverOtpEmailStatus = emailResult.status;
+        updatePayload.handoverOtpEmailError = emailResult.success ? "" : (emailResult.errorReason || "Failed to deliver OTP email.");
       }
 
       const claimUpdate = await claimsCollection().updateOne(
@@ -2993,18 +3238,155 @@ export function createApp(collectionFactory = {}) {
       }).catch(() => {});
 
       res.json({
-        message: status === "approved" && updatePayload.handoverOtpEmailStatus === "failed"
-          ? "Claim approved, but the handover OTP email could not be delivered. SMTP configuration or delivery must be corrected."
+        message: status === "approved"
+          ? (updatePayload.handoverOtpEmailStatus === "sent"
+              ? "Claim approved and handover OTP emailed to claimant."
+              : updatePayload.handoverOtpEmailStatus === "smtp_not_configured"
+                ? "Claim approved, but email delivery is unavailable because SMTP is not configured."
+                : "Claim approved, but the handover OTP email could not be delivered.")
           : `Claim status successfully updated to ${status.toUpperCase()}.`,
         status,
         handover: status === "approved"
           ? {
               otpEmailStatus: updatePayload.handoverOtpEmailStatus,
+              otpEmailError: updatePayload.handoverOtpEmailError || undefined,
               expiresInMinutes: updatePayload.handoverOtpExpiresAt
                 ? Math.max(1, Math.ceil((updatePayload.handoverOtpExpiresAt.getTime() - Date.now()) / 60000))
                 : null
             }
           : undefined
+      });
+    } catch (error) {
+      res.status(500).json({ message: error.message });
+    }
+  });
+
+  // Admin Handover OTP Email Retry
+  app.post("/api/admin/claims/:id/handover/retry-email", requireAdmin(usersCollection), async (req, res) => {
+    try {
+      const claimSelector = createIdSelector(req.params.id);
+      if (!claimSelector) {
+        return res.status(400).json({ message: "Invalid claim ID." });
+      }
+
+      const claim = await claimsCollection().findOne({ _id: claimSelector });
+      if (!claim) {
+        return res.status(404).json({ message: "Claim not found." });
+      }
+
+      if (claim.status !== "approved") {
+        return res.status(409).json({ message: "Only approved claims awaiting handover have an active OTP." });
+      }
+
+      if (!claim.handoverOtpHash || !claim.handoverOtpExpiresAt) {
+        return res.status(410).json({ message: "No active handover OTP exists for this claim." });
+      }
+
+      if (new Date(claim.handoverOtpExpiresAt).getTime() <= Date.now()) {
+        return res.status(410).json({ message: "The handover OTP has expired and cannot be resent. Please re-arbitrate." });
+      }
+
+      // Check rate limit: maximum 5 retries per 10 minutes per claim
+      const tenMinutesAgo = new Date(Date.now() - 10 * 60 * 1000);
+      const recentRetries = (claim.claimHistory || []).filter(
+        (h) => h.action === "otp_email_retry" && new Date(h.timestamp) >= tenMinutesAgo
+      ).length;
+      if (recentRetries >= 5) {
+        return res.status(429).json({ message: "Too many email retry attempts. Please wait before retrying again." });
+      }
+
+      if (!claim.handoverOtpEncrypted) {
+        return res.status(409).json({
+          message: "Secure OTP retry is not available for this claim because it was generated before encrypted retry support."
+        });
+      }
+
+      const decryptedOtp = decryptOtp(claim.handoverOtpEncrypted);
+      if (!decryptedOtp) {
+        return res.status(500).json({ message: "Could not safely recover OTP for retry. Security decryption failed." });
+      }
+
+      if (sha256(decryptedOtp) !== claim.handoverOtpHash) {
+        return res.status(500).json({ message: "Security integrity check failed: OTP mismatch." });
+      }
+
+      const targetItem = await itemsCollection().findOne({ _id: claim.itemId });
+      const claimantUser = await usersCollection().findOne({ studentId: claim.claimantId });
+      const recipientEmail = claimantUser?.email || claim.claimantEmail;
+      const remainingMinutes = Math.max(1, Math.ceil((new Date(claim.handoverOtpExpiresAt).getTime() - Date.now()) / 60000));
+
+      const emailResult = await sendHandoverOtp({
+        recipientEmail,
+        studentName: claimantUser?.name || claim.claimantName,
+        itemName: targetItem?.itemName || "Reported Item",
+        handoverLocation: claim.handoverLocation || "Campus Security Desk",
+        otp: decryptedOtp,
+        expiresMinutes: remainingMinutes
+      });
+
+      const auditEvent = {
+        action: "otp_email_retry",
+        performedBy: req.userId,
+        role: "admin",
+        details: emailResult.success
+          ? "Handover OTP email resent successfully to claimant."
+          : `Handover OTP email retry failed: ${emailResult.errorReason || "SMTP error"}`,
+        timestamp: new Date()
+      };
+
+      await claimsCollection().updateOne(
+        { _id: claimSelector },
+        {
+          $set: {
+            handoverOtpEmailStatus: emailResult.status,
+            handoverOtpEmailError: emailResult.success ? "" : (emailResult.errorReason || "Failed to deliver OTP email."),
+            updatedAt: new Date()
+          },
+          $push: { claimHistory: auditEvent }
+        }
+      );
+
+      await recordAudit({
+        adminId: req.userId,
+        adminName: req.currentUser.name,
+        action: "CLAIM_HANDOVER_OTP_EMAIL_RETRY",
+        targetClaimId: claim._id,
+        targetItemId: claim.itemId,
+        targetUserId: claim.claimantId,
+        details: emailResult.success ? "Resent handover OTP email to claimant." : `Email retry failed: ${emailResult.errorReason}`,
+        req
+      });
+
+      if (!emailResult.success) {
+        return res.status(502).json({
+          message: emailResult.errorReason || "Failed to deliver handover OTP email.",
+          handoverOtpEmailStatus: emailResult.status,
+          errorReason: emailResult.errorReason
+        });
+      }
+
+      res.json({
+        message: "Handover OTP email resent successfully to the claimant.",
+        handoverOtpEmailStatus: emailResult.status,
+        recipientEmail: claimantUser?.email || claim.claimantEmail
+      });
+    } catch (error) {
+      console.error("OTP email retry error:", error);
+      res.status(500).json({ message: error.message });
+    }
+  });
+
+  // Admin SMTP Status
+  app.get("/api/admin/smtp/status", requireAdmin(usersCollection), async (req, res) => {
+    try {
+      const config = getSmtpConfig();
+      res.json({
+        configured: config.isConfigured,
+        missingFields: config.missingFields,
+        host: config.host || null,
+        port: config.port,
+        user: config.user ? config.user.replace(/^(.)(.*)(@.*)$/, "$1***$3") : null,
+        from: config.from
       });
     } catch (error) {
       res.status(500).json({ message: error.message });
@@ -3564,9 +3946,21 @@ async function startServer() {
     const confirmationsToResume = await matches.find({ status: "confirming" }).toArray();
     for (const match of confirmationsToResume) {
       try {
-        const completed = await completeMatchConfirmation(match, () => items, () => matches);
-        if (!completed) {
-          console.error(`Match confirmation ${match._id} needs manual review because its linked reports are missing.`);
+        if (match.confirmedBy == null) {
+          await matches.updateOne(
+            { _id: match._id, status: "confirming", confirmedBy: { $in: [null] } },
+            { $set: { confirmedBy: match.lostReportedBy } }
+          );
+        }
+        const completed = await completeMatchConfirmation(
+          match,
+          () => items,
+          () => matches,
+          () => claims,
+          match.confirmedBy || match.lostReportedBy
+        );
+        if (!completed.ok && completed.reason !== "busy") {
+          console.error(`[MatchConfirmation] Startup recovery needs review for ${match._id}: ${completed.reason}`);
         }
       } catch (error) {
         console.error(`Could not resume match confirmation ${match._id}:`, error);
@@ -3574,6 +3968,25 @@ async function startServer() {
     }
 
     console.log("MongoDB connected successfully!");
+
+    const smtpConfig = getSmtpConfig();
+    if (!smtpConfig.isConfigured) {
+      console.warn(
+        `[SMTP Warning] SMTP is not configured. Missing: ${smtpConfig.missingFields.join(", ")}. Handover OTP emails will fail until SMTP is configured in .env.`
+      );
+    } else {
+      console.log(`[SMTP] Checking connection to ${smtpConfig.host}:${smtpConfig.port}...`);
+      try {
+        const verifyResult = await verifySmtpConnection();
+        if (verifyResult.success) {
+          console.log(`[SMTP] Connection verified successfully for ${smtpConfig.host}:${smtpConfig.port}`);
+        } else {
+          console.warn(`[SMTP Warning] SMTP verification failed: ${verifyResult.errorReason}`);
+        }
+      } catch (smtpErr) {
+        console.warn(`[SMTP Warning] SMTP connection check error: ${sanitizeSmtpError(smtpErr)}`);
+      }
+    }
 
     app.listen(PORT, () => {
       console.log(`CampusFind server running at http://localhost:${PORT}`);
@@ -3588,4 +4001,4 @@ if (process.env.NODE_ENV !== "test") {
   startServer();
 }
 
-export { app, startServer, parseStudentId };
+export { app, startServer, parseStudentId, compareItemReporterToUser };
